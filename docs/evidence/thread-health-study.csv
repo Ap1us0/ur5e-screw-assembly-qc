@@ -1,0 +1,13 @@
+case,fault,site,seed,strip_depth_mm,actual,stop_code,attempts,diagnosis,fault_depth_mm,fault_turns,fault_advance_mm,fault_torque_nm,fault_trigger,correct,false_pass
+normal,none,S2,0,,pass,,seated,normal,,,,,,True,False
+normal_variation,none,S2,103,,pass,,seated,normal,,,,,,True,False
+cross_S1,cross_thread,S1,106,,pass,,jammed / seated,recovered_after_retry,3.6830212133876077,0.0047665885625906845,-0.009708155665186236,0.2,stall,True,False
+cross_S2,cross_thread,S2,106,,pass,,jammed / seated,recovered_after_retry,3.534307545744533,0.00498863302920302,0.02249361615756784,0.2,stall,True,False
+cross_S3,cross_thread,S3,118,,pass,,jammed / seated,recovered_after_retry,3.3808741216200393,0.005234615412819833,0.025061343170318384,0.2,stall,True,False
+crushed_S1,damaged_thread,S1,106,,review,jam_retry_limit,jammed / jammed,jam_retry_limit,2.8823469958008525,0.004675776390090292,-0.0077893294328917895,0.2,stall,True,False
+crushed_S2,damaged_thread,S2,106,,review,jam_retry_limit,jammed / jammed,jam_retry_limit,2.860254974170237,0.0048637818964948005,-0.006834389894655457,0.2,stall,True,False
+crushed_S3,damaged_thread,S3,118,,review,jam_retry_limit,jammed / jammed,jam_retry_limit,2.8575505727360397,0.004840624996044709,-0.006453534410005846,0.2,stall,True,False
+crushed_with_tilt,damaged_thread,S2,106,,review,jam_retry_limit,jammed / jammed,jam_retry_limit,3.112921709001584,,,0.16924274380589363,tilt_load,True,False
+strip_S1,stripped_thread,S1,106,1.5,review,thread_slip_retry_limit,slipped / slipped,thread_slip_retry_limit,1.44906175660231,0.3633376864911035,0.2196393158857557,0.02954489384468187,thread_slip_detected,True,False
+strip_S2,stripped_thread,S2,106,2.4,review,thread_slip_retry_limit,slipped / slipped,thread_slip_retry_limit,2.3211886938495074,0.36325730482412444,0.20491055279003856,0.029627110072344993,thread_slip_detected,True,False
+strip_S3,stripped_thread,S3,118,3.8,review,thread_slip_retry_limit,slipped / slipped,thread_slip_retry_limit,3.6428922922299574,0.3630256468417992,0.2232318745033628,0.029857355417663777,thread_slip_detected,True,False

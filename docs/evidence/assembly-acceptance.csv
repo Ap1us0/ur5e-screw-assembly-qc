@@ -1,0 +1,21 @@
+label,seed,outcome,fault,fault_site,image_fault,image_site,observed,matched,evidence_ok,correct,false_pass,installed,stop_code,inspection,error,cycle_time_s,assembly_time_s,arm_settling_s
+baseline,0,pass,none,S2,none,S2,pass,True,True,True,False,3,,pass,,27.758499999980657,24.29949999998872,3.863499999996573
+tolerance_102,102,pass,none,S2,none,S2,pass,True,True,True,False,3,,pass,,28.046999999979985,24.587999999988046,3.8629999999967426
+tolerance_103,103,pass,none,S2,none,S2,pass,True,True,True,False,3,,pass,,28.047999999979982,24.588999999988044,3.862999999996744
+tolerance_104,104,pass,none,S2,none,S2,pass,True,True,True,False,3,,pass,,27.948999999980213,24.489999999988274,3.8634999999967428
+glare_S1,105,pass,none,S2,glare,S1,pass,True,True,True,False,3,,pass,,29.12649999997747,24.59049999998804,4.00599999999641
+glare_S2,106,pass,none,S2,glare,S2,pass,True,True,True,False,3,,pass,,29.135499999977448,24.587499999988047,3.9654999999965033
+glare_S3,107,pass,none,S2,glare,S3,pass,True,True,True,False,3,,pass,,28.916999999977957,24.584999999988053,3.9574999999965246
+blur_S1,108,pass,none,S2,blur,S1,pass,True,True,True,False,3,,pass,,29.122999999977477,24.58699999998805,4.00599999999641
+blur_S2,109,pass,none,S2,blur,S2,pass,True,True,True,False,3,,pass,,29.12999999997746,24.58199999998806,3.9644999999965043
+blur_S3,110,pass,none,S2,blur,S3,pass,True,True,True,False,3,,pass,,28.923499999977942,24.591499999988038,3.958499999996526
+all_angles_bad_S1,111,review,none,S2,both_bad,S1,review,True,True,True,False,3,,review,,29.124999999977472,24.588999999988044,4.006499999996409
+all_angles_bad_S3,112,review,none,S2,both_bad,S3,review,True,True,True,False,3,,review,,28.92049999997795,24.588499999988045,3.9564999999965247
+misaligned_S1,113,aborted,misaligned,S1,none,S2,aborted,True,True,True,False,0,alignment,,S1 · 对孔超差，横向 2.90 mm，未驱动批头,3.9115000000004736,,0.6790000000001517
+misaligned_S2,114,aborted,misaligned,S2,none,S2,aborted,True,True,True,False,1,alignment,,S2 · 对孔超差，横向 3.12 mm，未驱动批头,12.06150000000325,,1.7330000000010224
+misaligned_S3,115,aborted,misaligned,S3,none,S2,aborted,True,True,True,False,2,alignment,,S3 · 对孔超差，横向 3.08 mm，未驱动批头,21.113999999996143,,2.5824999999997322
+blocked_S1,116,aborted,blocked,S1,none,S2,aborted,True,True,True,False,0,obstruction,,S1 · 未达到入座深度即触碰障碍，深度 2.82 mm，已停转,5.313499999999775,,0.6835000000001532
+blocked_S2,117,aborted,blocked,S2,none,S2,aborted,True,True,True,False,1,obstruction,,S2 · 未达到入座深度即触碰障碍，深度 2.82 mm，已停转,13.45250000000495,,1.7370000000010268
+blocked_S3,118,aborted,blocked,S3,none,S2,aborted,True,True,True,False,2,obstruction,,S3 · 未达到入座深度即触碰障碍，深度 2.82 mm，已停转,22.5049999999929,,2.586499999999718
+empty_feeder_S1,119,aborted,empty_feeder,S1,none,S2,aborted,True,True,True,False,0,pickup_contact,,S1 · 批头未可靠接触供料位螺丝，间距 102.92 mm,1.710999999999867,,0.1189999999999869
+empty_feeder_S3,120,aborted,empty_feeder,S3,none,S2,aborted,True,True,True,False,2,pickup_contact,,S3 · 批头未可靠接触供料位螺丝，间距 103.06 mm,17.989500000003424,,2.147000000000745
