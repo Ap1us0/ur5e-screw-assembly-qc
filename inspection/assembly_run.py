@@ -2,6 +2,7 @@ import os
 import threading
 import time
 from contextlib import ExitStack, closing
+from dataclasses import asdict
 from html import escape
 
 import cv2
@@ -10,12 +11,14 @@ import numpy as np
 
 from .assembly import Assembly, AssemblyStopped, ENGAGE_XY_M, PITCH_MM, TORQUE_TARGET_NM
 from .demo import FPS, VIDEO_SIZE, VIEW_SIZE, overlay_text, overview_camera
-from .detector import SITES
+from .detector import SITES, save_image
 from .samples import write_csv, write_json
+from .vision_alignment import FixtureShift, marked_photo
 from .workflow import inspect_workpiece, new_run
 
 
 STAGES = {
+    'calibration': 'Locate empty hole',
     'ready': 'Ready', 'approach_feed': 'Approach feeder', 'index': 'Index bit', 'pick': 'Pick screw',
     'lift': 'Verify pickup', 'transfer': 'Transfer over fixture', 'align': 'Align to hole',
     'insert': 'Enter thread', 'tighten': 'Drive and torque-check',
@@ -46,6 +49,7 @@ class AssemblyView:
         self.photo = None
         self.photo_label = ''
         self.photos = {}
+        self.registration_photo = None
         if viewer:
             with viewer.lock():
                 overview_camera(viewer.cam)
@@ -70,7 +74,16 @@ class AssemblyView:
             self.photo_label = f'{site} / {angle.title()} / {observation.state.title()}'
             self.photos[site] = self.photo, observation.state
 
+    def preview_registration(self, attempt, marked):
+        label = f'{attempt["site"]} / {attempt["angle"].title()} / '
+        label += 'Hole located' if attempt['observation'] else 'No reliable hole'
+        self.registration_photo = cv2.cvtColor(marked, cv2.COLOR_BGR2RGB), label
+        self.draw(hold_frames=FPS // 3)
+
     def closeup(self):
+        if self.rig.stage == 'calibration' and self.registration_photo is not None:
+            image, label = self.registration_photo
+            return cv2.resize(image, INSET_SIZE, interpolation=cv2.INTER_AREA), label
         if self.result and len(self.photos) == 3:
             width, height = INSET_SIZE
             montage = np.full((height, width, 3), (29, 44, 56), dtype=np.uint8)
@@ -88,7 +101,7 @@ class AssemblyView:
             self.detail_renderer = mujoco.Renderer(self.rig.model, width=INSET_SIZE[0], height=INSET_SIZE[1])
         at_feeder = self.rig.stage in ('ready', 'approach_feed', 'index', 'pick', 'lift')
         station = self.rig.station
-        center = station.screw_nominal if at_feeder else station.entry_nominal
+        center = station.screw_nominal if at_feeder else station.entry_actual
         self.detail.lookat[:] = center + (0, 0, 0.015)
         self.detail_renderer.update_scene(self.rig.data, camera=self.detail, scene_option=self.rig.options)
         label = f'Feeder {station.name}' if at_feeder else f'{station.name} close-up'
@@ -109,6 +122,9 @@ class AssemblyView:
         driver_state = 'Running' if metrics['spindle_velocity_command_rad_s'] else 'Stopped'
         depth = max(0.0, metrics['insertion_depth_mm'])
         progress = '  /  '.join(f'{site} {entry["status"]}' for site, entry in self.rig.results.items())
+        if self.rig.stage == 'calibration':
+            located = sum(record['observation'] is not None for record in self.rig.alignment_attempts)
+            progress = f'Wrist camera registration   {located} / 3 holes'
         cutoff = self.rig.results[metrics['site']]['torque_cutoff']
         display_torque = cutoff['spindle_torque_nm'] if self.result and cutoff else metrics['spindle_torque_nm']
         if visible:
@@ -242,15 +258,50 @@ def write_assembly_report(folder, report):
     error = f'<p>{escape(report["error"])}</p>' if report['error'] else ''
     motion_label = {'baseline': '基准运动', 'optimized': '优化运动'}[report['motion']]
     duration = f'{motion_label} · 整轮仿真 {report["cycle_time_s"]:.2f} s'
+    alignment = ''
+    if report['alignment'] == 'vision':
+        write_registration_report(folder, report)
+        links.append('<a href="registration.html">三孔定位原图与估计结果</a>')
+        estimate = report['registration']
+        if estimate:
+            alignment = (f'<p>腕部相机估计夹具偏移 ({estimate["x_mm"]:.2f}, {estimate["y_mm"]:.2f}) mm，'
+                         f'转角 {estimate["yaw_deg"]:.2f}°。</p>')
     page = f'''<!doctype html><html lang="zh-CN"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>UR5e 装配结果</title>
 <style>body{{background:#f3f6f6;color:#193039;font:16px/1.6 "Microsoft YaHei",sans-serif;margin:0}}
 main{{max-width:1080px;margin:auto;padding:28px 18px}}h1{{margin:.15em 0}}p{{margin:10px 0}}
 table{{width:100%;border-collapse:collapse;background:#fff}}th,td{{padding:7px;text-align:left;border-bottom:1px solid #d8e3e5}}
 video,img{{display:block;width:100%;border-radius:8px;margin-top:18px}}a{{color:#165669}}</style>
-<main><p>MuJoCo · UR5e</p><h1>{title}</h1><p>{duration}</p>{error}<table><tr><th>位置</th><th>结果</th><th>撤刀后深度</th>
+<main><p>MuJoCo · UR5e</p><h1>{title}</h1><p>{duration}</p>{alignment}{error}<table><tr><th>位置</th><th>结果</th><th>撤刀后深度</th>
 <th>圈数</th><th>停转扭矩</th></tr>{''.join(rows)}</table><p>{' · '.join(links)}</p>{visual}</main></html>'''
     (folder / 'report.html').write_text(page, encoding='utf-8')
+
+
+def write_registration_report(folder, report):
+    estimate = report['registration']
+    info = ''
+    if estimate:
+        residual = max(estimate['residuals_mm'].values())
+        error = max(estimate['actual_center_errors_mm'].values())
+        info = (f'<p>估计偏移 ({estimate["x_mm"]:.3f}, {estimate["y_mm"]:.3f}) mm，转角 {estimate["yaw_deg"]:.3f}°。</p>'
+                f'<p>最大拟合残差 {residual:.3f} mm。与仿真真值比较的最大孔中心误差 {error:.3f} mm。</p>')
+    elif report['error']:
+        info = f'<p>{escape(report["error"])}</p>'
+    views = ''.join(f'<figure><img src="{escape(a["marked_photo"])}" alt="定位叠加图">'
+                    f'<figcaption>{a["site"]} · {a["angle"]} · {escape(a["reason"])} · '
+                    f'<a href="{escape(a["photo"])}">原图</a></figcaption></figure>'
+                    for a in report['alignment_attempts'])
+    html = f'''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>腕部相机三孔定位</title>
+<meta name="viewport" content="width=device-width, initial-scale=1"><style>
+body{{background:#eef3f4;color:#193039;font:16px/1.6 "Microsoft YaHei",sans-serif;margin:0}}
+main{{max-width:1000px;margin:auto;padding:24px}}h1,p{{margin:.4em 0}}img{{width:100%;border-radius:6px}}
+.views{{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:14px;margin-top:18px}}
+figure{{margin:0;padding:10px;background:#fff;border-radius:8px}}a{{color:#165669}}
+</style><main><p>MuJoCo · UR5e · 入牙前定位</p><h1>腕部相机三孔定位</h1>{info}
+<p>黄色十字是示教位置，绿色圆与十字是画面中估计的孔中心。</p>
+<p><a href="report.html">返回装配报告</a> · <a href="assembly.json">定位数据 JSON</a></p>
+<div class="views">{views}</div></main></html>'''
+    (folder / 'registration.html').write_text(html, encoding='utf-8')
 
 
 def run_round(rig, detector, output, viewer, record):
@@ -259,7 +310,9 @@ def run_round(rig, detector, output, viewer, record):
     result = dict(version=2, source='simulation', scenario=rig.scenario,
                   fault_site=rig.mechanical_fault_site if rig.scenario != 'none' else None,
                   seed=rig.seed, image_fault=rig.image_fault, image_site=rig.image_site, conditions=rig.conditions,
-                  motion=rig.motion,
+                  motion=rig.motion, alignment=rig.alignment, fixture_shift_truth=asdict(rig.fixture_shift),
+                  alignment_fault=rig.alignment_fault, alignment_fault_site=rig.alignment_fault_site,
+                  registration=None,
                   order=list(rig.sites), status='error', error=None, stop_code=None, inspection_started_at_s=None,
                   inspection_verdict=None, inspection_report=None)
     with ExitStack() as resources:
@@ -280,6 +333,22 @@ def run_round(rig, detector, output, viewer, record):
         rig.on_frame = view.sample
         try:
             view.draw(hold_frames=FPS // 2)
+            if rig.alignment == 'vision':
+                def store_attempt(attempt, image, observation):
+                    stem = f'calibration/{attempt["site"]}_{attempt["angle"]}'
+                    (folder / 'calibration').mkdir(exist_ok=True)
+                    marked = marked_photo(image, observation, attempt['nominal_uv'])
+                    attempt.update(photo=f'{stem}.png', marked_photo=f'{stem}_marked.png')
+                    save_image(folder / attempt['photo'], image)
+                    save_image(folder / attempt['marked_photo'], marked)
+                    view.preview_registration(attempt, marked)
+
+                fit = rig.register_fixture(store_attempt)
+                fit['actual_center_errors_mm'] = {
+                    site: float(1000 * np.linalg.norm(center - rig.stations[site].entry_actual[:2]))
+                    for site, center in fit['centers_m'].items()
+                }
+                result['registration'] = fit
             rig.assemble()
             rig.stage = 'inspection'
             result['inspection_started_at_s'] = float(rig.data.time)
@@ -291,7 +360,8 @@ def run_round(rig, detector, output, viewer, record):
             result['status'] = 'pass' if report['verdict'] == 'pass' else 'review'
             rig.verify_all_retained()
         except AssemblyStopped as exc:
-            result.update(status='aborted', stop_code=exc.code, error=f'{rig.station.name} · {exc}')
+            message = str(exc) if exc.code == 'registration_fit' else f'{rig.station.name} · {exc}'
+            result.update(status='aborted', stop_code=exc.code, error=message)
             rig.event('aborted')
             try:
                 rig.brake_spindle()
@@ -306,6 +376,7 @@ def run_round(rig, detector, output, viewer, record):
         view.result = result['status']
         view.draw(hold_frames=2 * FPS)
     result.update(positions=rig.results, events=rig.events, moves=rig.moves, cycle_time_s=float(rig.data.time),
+                  alignment_attempts=rig.alignment_attempts,
                   final={site: rig.snapshot(station) for site, station in rig.stations.items()})
     if not view.rows:
         view.rows.append(rig.snapshot())
@@ -320,7 +391,8 @@ def run_round(rig, detector, output, viewer, record):
 
 
 def run_assembly(detector, output, fault, *, sites=SITES, fault_site='S2', seed=0, image_fault='none',
-                 image_site='S2', motion='optimized', viewer=False, video=False):
+                 image_site='S2', motion='optimized', alignment='fixed', fixture_shift=FixtureShift(),
+                 alignment_fault='none', alignment_fault_site='S2', viewer=False, video=False):
     if detector.source != 'simulation':
         raise ValueError('装配演示需要仿真检测配置')
     start, open_report = threading.Event(), threading.Event()
@@ -332,7 +404,9 @@ def run_assembly(detector, output, fault, *, sites=SITES, fault_site='S2', seed=
             open_report.set()
 
     with ExitStack() as resources:
-        rig = Assembly(fault, sites, fault_site, seed=seed, image_fault=image_fault, image_site=image_site, motion=motion)
+        rig = Assembly(fault, sites, fault_site, seed=seed, image_fault=image_fault, image_site=image_site,
+                       motion=motion, alignment=alignment, fixture_shift=fixture_shift,
+                       alignment_fault=alignment_fault, alignment_fault_site=alignment_fault_site)
         resources.callback(rig.close)
         if not viewer:
             return run_round(rig, detector, output, None, video)

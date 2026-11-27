@@ -1,17 +1,19 @@
 import math
 import xml.etree.ElementTree as ET
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 import mujoco
 import numpy as np
 
-from .detector import SITES
+from .detector import ANGLES, SITES
 from .simulation import FAULTS, MODELS, Simulation, compile_model
+from .vision_alignment import ALIGNMENT_FAULTS, HOLE_PLANE_Z_M, FixtureShift, Pinhole, find_hole, fit_fixture, mask_observation
 
 
 ASSEMBLY_FAULTS = ('none', 'misaligned', 'blocked', 'empty_feeder')
 MOTION_PROFILES = ('optimized', 'baseline')
+ALIGNMENT_MODES = ('fixed', 'vision')
 DEPTH_M = 0.006
 PITCH_MM = 2.0
 ENGAGE_XY_M = 0.00065
@@ -39,12 +41,24 @@ def set_position(element, x=None, y=None):
     element.set('pos', f'{old_x if x is None else x:.6f} {old_y if y is None else y:.6f} {z:.6f}')
 
 
-def assembly_model(fault, stations, fault_site, conditions):
+def assembly_model(fault, stations, fault_site, conditions, fixture_shift, alignment):
     scene = ET.parse(MODELS / 'inspection.xml').getroot()
     extra = ET.parse(MODELS / 'assembly.xml').getroot()
-    scene.set('model', 'UR5e screw assembly')
+    scene.set('model', 'UR5e vision-guided assembly' if alignment == 'vision' else 'UR5e screw assembly')
     scene.find('option').set('timestep', '0.0005')
     world = scene.find('worldbody')
+    if fixture_shift != FixtureShift():
+        moved = ('fixture', 'workpiece', 'left_clamp', 'right_clamp')
+        prefixes = ('hole_', 'head_', 'slot1_', 'slot2_')
+        for geom in world.findall('geom'):
+            name = geom.get('name', '')
+            if name in moved or name.startswith(prefixes):
+                xy = fixture_shift.apply([float(v) for v in geom.get('pos').split()[:2]])
+                set_position(geom, *xy)
+                if name in moved or name.startswith(('slot1_', 'slot2_')):
+                    euler = [float(v) for v in geom.get('euler', '0 0 0').split()]
+                    euler[2] += math.radians(fixture_shift.yaw_deg)
+                    geom.set('euler', ' '.join(f'{v:.9f}' for v in euler))
     equality = ET.SubElement(scene, 'equality')
     for station in stations:
         index = SITES.index(station)
@@ -57,7 +71,7 @@ def assembly_model(fault, stations, fault_site, conditions):
                 continue
             element = instance(template, station)
             if name in ('thread_guide', 'blocked_seat'):
-                set_position(element, x, y)
+                set_position(element, *fixture_shift.apply([x, y]))
             else:
                 set_position(element, feeder_x)
             if name == 'loose_screw':
@@ -102,11 +116,13 @@ class Station:
     free_damping: float
     screw_nominal: np.ndarray
     entry_nominal: np.ndarray
+    entry_actual: np.ndarray
 
 
 class Assembly(Simulation):
     def __init__(self, fault='none', sites=SITES, fault_site='S2', *, seed=0, image_fault='none', image_site='S2',
-                 motion='optimized'):
+                 motion='optimized', alignment='fixed', fixture_shift=FixtureShift(), alignment_fault='none',
+                 alignment_fault_site='S2'):
         if fault not in ASSEMBLY_FAULTS:
             raise ValueError(f'未知装配工况 {fault}')
         self.sites = tuple(sites)
@@ -118,13 +134,22 @@ class Assembly(Simulation):
             raise ValueError('仿真种子或图像故障设置无效')
         if motion not in MOTION_PROFILES:
             raise ValueError(f'未知运动曲线 {motion}')
+        if alignment not in ALIGNMENT_MODES or alignment_fault not in ALIGNMENT_FAULTS or alignment_fault_site not in SITES:
+            raise ValueError('视觉定位方式或故障设置无效')
+        if alignment == 'vision' and self.sites != SITES:
+            raise ValueError('视觉定位需要 S1、S2、S3 三个空孔')
+        if alignment != 'vision' and alignment_fault != 'none':
+            raise ValueError('定位图像故障需要视觉定位模式')
         self.motion = motion
+        self.alignment, self.fixture_shift = alignment, fixture_shift
+        self.alignment_fault, self.alignment_fault_site = alignment_fault, alignment_fault_site
         self.seed, self.image_fault, self.image_site = seed, image_fault, image_site
         rng = np.random.default_rng(seed)
         self.conditions = {site: dict(feeder_offset_mm=rng.uniform(-0.23, 0.23, 2).tolist() if seed else [0., 0.],
                                      position_bias_mm=rng.uniform(-0.28, 0.28, 2).tolist() if seed else [0., 0.],
                                      bearing_scale=float(rng.uniform(0.87, 1.13)) if seed else 1.) for site in self.sites}
-        super().__init__(assembly_model(fault, self.sites, fault_site, self.conditions))
+        super().__init__(assembly_model(fault, self.sites, fault_site, self.conditions, fixture_shift, alignment))
+        self.taught_camera_plans = self.plans.copy()
         # A MuJoCo general position servo produces Kp*(u-q)-Kd*qdot with the model's 1:1 gear.
         self.velocity_feedforward = -self.model.actuator_biasprm[:6, 2] / self.model.actuator_gainprm[:6, 0]
         self.scenario = fault
@@ -145,11 +170,13 @@ class Assembly(Simulation):
             feeder = model.geom(f'feeder_seat_{site}')
             nominal = feeder.pos.copy()
             nominal[2] += feeder.size[1]
+            actual = model.body(f'thread_guide_{site}').pos.copy()
+            taught = np.r_[model.site(site).pos[:2], actual[2]]
             station = Station(site, model.site(f'screw_socket_{site}').id, model.site(f'screw_axis_{site}').id,
                               model.geom(f'assembled_head_{site}').id, block,
                               model.equality(f'magnetic_bit_{site}').id, model.equality(f'thread_capture_{site}').id,
                               model.equality(f'keyed_drive_{site}').id, turn, dof, float(model.dof_damping[dof]),
-                              nominal, model.body(f'thread_guide_{site}').pos.copy())
+                              nominal, taught, actual)
             self.stations[site] = station
             self.allowed_pairs.update(frozenset((station.head, geom)) for geom in (
                 self.bit, self.plate, block, model.geom(f'feeder_seat_{site}').id, model.geom(f'feeder_base_{site}').id,
@@ -162,6 +189,9 @@ class Assembly(Simulation):
         self.stage = 'ready'
         self.events = []
         self.moves = []
+        self.registration = None
+        self.alignment_attempts = []
+        self.plans = self.taught_camera_plans.copy()
         self.station = self.stations[self.sites[0]]
         self.results = {site: dict(status='pending', after_retract=None, torque_cutoff=None, peak_torque_nm=0.0,
                                    peak_seat_force_n=0.0) for site in self.sites}
@@ -191,11 +221,11 @@ class Assembly(Simulation):
         position = data.site_xpos[station.screw]
         tip = data.site_xpos[self.tip]
         normal = data.site_xmat[station.screw].reshape(3, 3)[:, 2]
-        depth = station.entry_nominal[2] - position[2]
+        depth = station.entry_actual[2] - position[2]
         return dict(sim_time_s=float(data.time), stage=self.stage, site=station.name,
                     screw_x_m=float(position[0]), screw_y_m=float(position[1]), screw_z_m=float(position[2]),
                     tip_x_m=float(tip[0]), tip_y_m=float(tip[1]), tip_z_m=float(tip[2]),
-                    radial_error_mm=float(1000 * np.linalg.norm(position[:2] - station.entry_nominal[:2])),
+                    radial_error_mm=float(1000 * np.linalg.norm(position[:2] - station.entry_actual[:2])),
                     tilt_deg=math.degrees(math.acos(float(np.clip(normal[2], -1, 1)))),
                     insertion_depth_mm=float(1000 * depth),
                     thread_turns=float(data.joint(station.turn_joint).qpos[0] / (2 * math.pi)),
@@ -252,7 +282,47 @@ class Assembly(Simulation):
             self.step()
         mujoco.mj_forward(self.model, self.data)
 
+    def register_fixture(self, on_attempt):
+        self.stage = 'calibration'
+        measurements = []
+        camera_id = self.model.camera('inspection_camera').id
+        taught = np.array([self.stations[site].entry_nominal[:2] for site in SITES])
+        for site, xy in zip(SITES, taught):
+            self.station = self.stations[site]
+            observation = None
+            for angle in ANGLES:
+                image = self.capture_raw(site, angle)
+                camera = Pinhole(self.data.cam_xpos[camera_id].copy(), self.data.cam_xmat[camera_id].reshape(3, 3).copy(),
+                                 image.shape[1], image.shape[0], self.model.cam_fovy[camera_id])
+                fault = self.alignment_fault if site == self.alignment_fault_site else 'none'
+                if fault == 'glare' and angle == 'alternate':
+                    fault = 'none'
+                image = mask_observation(image, camera.project([*xy, HOLE_PLANE_Z_M]), fault)
+                observation, reason, expected = find_hole(image, camera, xy)
+                attempt = dict(site=site, angle=angle, at_s=float(self.data.time), reason=reason, nominal_uv=expected,
+                               observation=asdict(observation) if observation else None)
+                self.alignment_attempts.append(attempt)
+                on_attempt(attempt, image, observation)
+                if observation is not None:
+                    break
+            if observation is None:
+                raise AssemblyStopped('两个定位视角均无法确认孔位', 'registration_image')
+            measurements.append(observation.xy_m)
+        try:
+            self.registration, residuals = fit_fixture(taught, measurements)
+        except ValueError as exc:
+            raise AssemblyStopped(str(exc), 'registration_fit') from exc
+        # Registered centers come from image geometry. The simulator's true sites are reserved for scoring.
+        centers = self.registration.apply(taught)
+        self.plans = {(site, angle): self.plan_pose(site, angle, np.r_[xy, self.model.site(site).pos[2]])
+                      for site, xy in zip(SITES, centers) for angle in ANGLES}
+        self.active_pose = None
+        return dict(**asdict(self.registration), residuals_mm=dict(zip(SITES, residuals)),
+                    centers_m={site: xy.tolist() for site, xy in zip(SITES, centers)})
+
     def assemble(self):
+        if self.alignment == 'vision' and self.registration is None:
+            raise AssemblyStopped('未完成视觉定位，装配尚未启动', 'registration_required')
         for site, station in self.stations.items():
             self.station = station
             result = self.results[site]
@@ -298,6 +368,8 @@ class Assembly(Simulation):
         self.event('screw_lifted')
 
         approach = station.entry_nominal.copy()
+        if self.registration is not None:
+            approach[:2] = self.registration.apply(approach[:2])
         approach[2] += self.model.site(station.socket).pos[2]
         approach[:2] += np.asarray(self.conditions[station.name]['position_bias_mm']) / 1000
         if self.scenario == 'misaligned' and station.name == self.mechanical_fault_site:
@@ -308,8 +380,12 @@ class Assembly(Simulation):
         self.event('axis_alignment')
         if start_pose['radial_error_mm'] > 1000 * ENGAGE_XY_M or start_pose['tilt_deg'] > ENGAGE_TILT_DEG:
             raise AssemblyStopped(f"对孔超差，横向 {start_pose['radial_error_mm']:.2f} mm，未驱动批头", 'alignment')
-        if start_pose['radial_error_mm'] > 1000 * REFINE_XY_M:
-            approach[:2] -= self.data.site_xpos[station.screw, :2] - station.entry_nominal[:2]
+        if self.registration is None:
+            correction = station.entry_nominal[:2] - self.data.site_xpos[station.screw, :2]
+        else:
+            correction = self.registration.apply(station.entry_nominal[:2]) - self.data.site_xpos[self.tip, :2]
+        if np.linalg.norm(correction) > REFINE_XY_M:
+            approach[:2] += correction
             self.move_xyz('align', approach + (0, 0, 0.016), speed=0.20)
             self.event('alignment_refined')
         # The unloaded driver reference is calibrated with the bit at spring equilibrium.
@@ -373,7 +449,7 @@ class Assembly(Simulation):
         bearing_arm = BEARING_FRICTION_ARM_M * self.conditions[station.name]['bearing_scale']
         try:
             for step in range(round(8 / dt)):
-                depth = station.entry_nominal[2] - self.data.site_xpos[station.screw, 2]
+                depth = station.entry_actual[2] - self.data.site_xpos[station.screw, 2]
                 speed = 5.6 if depth >= 0.0054 else 13.0
                 self.data.ctrl[self.motor] = min(speed, (step + 1) * dt * 50)
                 rate = abs(self.data.qvel[station.turn_dof])

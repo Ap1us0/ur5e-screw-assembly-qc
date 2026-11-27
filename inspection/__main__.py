@@ -63,6 +63,11 @@ def main():
     assembly.add_argument('--image-fault', choices=('none', 'glare', 'blur', 'both_bad'), default='none')
     assembly.add_argument('--image-site', choices=SITES, default='S2')
     assembly.add_argument('--motion', choices=('optimized', 'baseline'), default='optimized')
+    assembly.add_argument('--alignment', choices=('fixed', 'vision'), default='fixed', help='定位方式')
+    assembly.add_argument('--fixture-shift', nargs=3, type=float, metavar=('X_MM', 'Y_MM', 'YAW_DEG'),
+                          default=(0, 0, 0), help='仿真中实际夹具的平面平移和转角')
+    assembly.add_argument('--alignment-fault', choices=('none', 'glare', 'occluded'), default='none')
+    assembly.add_argument('--alignment-fault-site', choices=SITES, default='S2')
     build = commands.add_parser('build-station', help='从真实示教点生成 PolyScope 5 脚本')
     build.add_argument('--station', type=Path, required=True)
     build.add_argument('--output', type=Path, required=True)
@@ -87,6 +92,10 @@ def main():
     compare.add_argument('--baseline', type=Path, required=True)
     compare.add_argument('--optimized', type=Path, required=True)
     compare.add_argument('--output', type=Path, default=OUTPUT / 'motion-comparison')
+    align_study = commands.add_parser('alignment-study', help='对比固定示教和腕部视觉定位在夹具偏移下的效果')
+    align_study.add_argument('--profile', type=Path, default=SAMPLES / 'profile.json')
+    align_study.add_argument('--output', type=Path, default=OUTPUT / 'vision-alignment' / 'study')
+    align_study.add_argument('--jobs', type=int, default=1)
     accept = commands.add_parser('evaluate', help='根据独立真值记录核对 20 轮报告')
     accept.add_argument('--manifest', type=Path, required=True)
     accept.add_argument('--source', choices=('hardware', 'simulation'), default='hardware')
@@ -125,11 +134,14 @@ def main():
                 return 1
         elif args.action == 'assemble':
             from .assembly_run import run_assembly
+            from .vision_alignment import FixtureShift
 
             sites = SITES if args.site == 'all' else (args.site,)
             fault_site = args.fault_site or ('S2' if args.site == 'all' else args.site)
             result = run_assembly(Detector(args.profile), args.output, args.fault, sites=sites, fault_site=fault_site,
                                   seed=args.seed, image_fault=args.image_fault, image_site=args.image_site, motion=args.motion,
+                                  alignment=args.alignment, fixture_shift=FixtureShift(*args.fixture_shift),
+                                  alignment_fault=args.alignment_fault, alignment_fault_site=args.alignment_fault_site,
                                   viewer=args.viewer, video=args.video)
             if result is not None:
                 return 0 if result[1]['status'] == 'pass' else 1
@@ -171,6 +183,12 @@ def main():
 
             folder, result = compare(args.baseline, args.optimized, args.output)
             print(f'节拍对比{"通过" if result["passed"] else "未通过"} · {folder / "report.html"}')
+            return 0 if result['passed'] else 1
+        elif args.action == 'alignment-study':
+            from .alignment_study import run_study
+
+            folder, result = run_study(args.profile.resolve(), args.output.resolve(), args.jobs)
+            print(f'视觉定位对比 {result["correct"]}/{result["rounds"]} · {folder / "report.html"}')
             return 0 if result['passed'] else 1
         elif args.action in ('evaluate', 'simulate-acceptance'):
             if args.action == 'evaluate':

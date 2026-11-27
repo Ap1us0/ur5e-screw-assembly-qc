@@ -41,8 +41,9 @@ class Simulation:
         self.plans = {(site, angle): self.plan_pose(site, angle) for site in SITES for angle in ANGLES}
         self.reset()
 
-    def plan_pose(self, site, angle):
-        target = self.model.site(site).pos
+    def plan_pose(self, site, angle, target=None):
+        if target is None:
+            target = self.model.site(site).pos
         offset = np.array([0.0, 0.0, 0.17] if angle == 'primary' else [0.056, -0.021, 0.169])
         point = target + offset
         z_axis = offset / np.linalg.norm(offset)
@@ -131,7 +132,7 @@ class Simulation:
         raise RuntimeError(f'MuJoCo 检测到碰撞 {self.model.geom(contact.geom1).name}/'
                            f'{self.model.geom(contact.geom2).name}')
 
-    def capture(self, site, angle):
+    def capture_raw(self, site, angle):
         self.active_pose = (site, angle)
         goal, _, _ = self.plans[self.active_pose]
         self.drive(goal)
@@ -139,7 +140,10 @@ class Simulation:
         if self.renderer is None:
             self.renderer = mujoco.Renderer(self.model, width=640, height=480)
         self.renderer.update_scene(self.data, camera='inspection_camera', scene_option=self.options)
-        image = cv2.cvtColor(self.renderer.render(), cv2.COLOR_RGB2BGR)
+        return cv2.cvtColor(self.renderer.render(), cv2.COLOR_RGB2BGR)
+
+    def capture(self, site, angle):
+        image = self.capture_raw(site, angle)
         if self.variation:
             shift = self.rng.integers(-2, 3, size=2).astype(np.float32)
             transform = np.float32([[1, 0, shift[0]], [0, 1, shift[1]]])

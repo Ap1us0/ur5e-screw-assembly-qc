@@ -32,6 +32,21 @@ $inspectionPython = '.\.venv\Scripts\python.exe'
 
 装配使用带轴向弹簧的电批、三颗独立自由体螺丝和固定夹具。取件前批头回到可对准的角度，再根据接触启用磁吸等效约束。对孔参考固定夹具坐标，门控使用仿真中的螺丝位姿反馈。各螺丝在各自的螺纹约束下保持留置，电批每次只连接当前螺丝。旋入阶段使用 MuJoCo 的标量关节等式约束表达 2.0 mm 螺距，模型用实际入座接触产生的法向力估算头部摩擦阻力。装配运动、螺丝转动和深度都由动力学积分产生。螺纹牙面和磁力场采用等效模型，0.14 N·m 扭矩门限、6 mm 深度目标和 0.65 mm 入牙对孔门限是该仿真工况设定。实机装配仍需实际电批、供料件、螺纹规格与扭矩标定。[MuJoCo 等式约束参考](https://mujoco.readthedocs.io/en/stable/XMLreference.html#equality-joint)
 
+## 腕部视觉定位与夹具偏移补偿
+
+在 `--alignment vision` 模式下，取件前先用腕部相机拍 S1、S2、S3 三个空孔。程序根据孔径、圆度和灰度对比度筛选孔缘，用相机内参和仿真手眼位姿把图像孔心投影到已知工件平面，再拟合夹具的 XY 平移和偏航角。装配对孔与最终质检的目标都由估计坐标更新。定位坐标来自图像，仿真孔位真值用于机械验证和离线精度统计。示教坐标对照使用 `--alignment fixed`。[MuJoCo 相机坐标](https://mujoco.readthedocs.io/en/stable/XMLreference.html#body-camera)
+
+```powershell
+& $inspectionPython -m inspection assemble --alignment vision --fixture-shift -8 4 -4 --seed 106 --alignment-fault glare --alignment-fault-site S2 --viewer --video
+& $inspectionPython -m inspection alignment-study --jobs 3
+```
+
+`--fixture-shift` 依次输入 X、Y（mm）与偏航（°）。它移动工件和真实螺纹孔，保留示教坐标。仿真配置允许的平移幅度上限为 12 mm，偏航绝对值上限为 6°。完全遮挡可用 `--alignment-fault occluded` 复现，主视角反光用 `glare` 复现。两个视角均找不到唯一可信孔缘，或三孔拟合残差超过 0.32 mm 时，流程在取件前结束。每轮 `registration.html` 展示示教点、估计孔心、拟合残差和各次拍摄的原图。
+
+批量对照将同一组 12 个偏移工况分别用固定示教与视觉定位跑一遍，并另做 3 轮双视角遮挡。视觉成功要求三孔定位、三颗装配、撤刀留置和最后的统一质检证据齐全，同时最大孔中心仿真真值误差不超过 0.20 mm。当前假定平面高度、相机内参与手眼外参已知。实机需测定这三项并验证镜头畸变、光照及重复装夹误差。
+
+本地仿真结果中，固定示教在 12 轮偏移工况全部触发对孔停机，视觉定位完成 12 轮装配和质检。3 轮双视角遮挡均在取件前中止。另跑 24 轮随机偏移，全部完成装配和质检。两组视觉试验的最大孔心误差为 0.083 mm。`alignment-study` 在输出目录保存每轮报告、CSV 与 JSON。
+
 ## 结项复现与验收
 
 在其他 Windows 电脑可用 Python 3.12 建立项目自己的环境，启动和验收流程相同。`requirements.txt` 锁定直接依赖。
