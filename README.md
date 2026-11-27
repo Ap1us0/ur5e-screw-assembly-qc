@@ -4,9 +4,12 @@
 
 **Windows · Python 3.12 · MuJoCo · OpenCV CPU**
 
-![UR5e 完成三颗螺丝装配并显示末尾的三张腕部照片](docs/overview.png)
+## 演示
 
-[看视觉定位与斜咬牙恢复](docs/media/vision-and-cross-thread.mp4) · [看滑牙待复检](docs/media/stripped-thread-review.mp4) · [看滑牙判定曲线](docs/fastening-signature.png)
+| 视觉找孔与斜咬牙恢复 | 持续滑牙与待复检 |
+| :---: | :---: |
+| ![UR5e 定位三个空孔，退牙扶正后装完三颗并统一质检](docs/media/vision-and-cross-thread.gif) | ![S2 连续滑牙，退回后停机并显示待复检](docs/media/stripped-thread-review.gif) |
+| S2 退牙扶正后重试成功，三颗全部通过质检。<br>[原速录像](docs/media/vision-and-cross-thread.mp4) | S2 复试仍空转，整件待复检，S3 暂停装配。<br>[原速录像](docs/media/stripped-thread-review.mp4) · [判定曲线](docs/fastening-signature.png) |
 
 ## 快速开始
 
