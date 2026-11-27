@@ -56,7 +56,8 @@ def main():
     assembly.add_argument('--output', type=Path, default=OUTPUT / 'assembly')
     assembly.add_argument('--viewer', action='store_true', help='用 MuJoCo Viewer 启动并观看装配')
     assembly.add_argument('--video', action='store_true', help='保存运动及局部装配录像')
-    assembly.add_argument('--fault', choices=('none', 'misaligned', 'blocked', 'retryable_jam', 'cross_thread', 'empty_feeder'),
+    assembly.add_argument('--fault', choices=('none', 'misaligned', 'blocked', 'retryable_jam', 'cross_thread',
+                                              'damaged_thread', 'stripped_thread', 'empty_feeder'),
                           default='none')
     assembly.add_argument('--site', choices=('all', *SITES), default='all', help='默认装配三处，也可单独验证一个位置')
     assembly.add_argument('--fault-site', choices=SITES, help='故障注入位置，三处模式默认 S2')
@@ -77,6 +78,7 @@ def main():
                           help='斜咬牙工况的电批入牙倾角')
     assembly.add_argument('--recovery', choices=('stop', 'retry', 'realign'), default='realign',
                           help='卡滞后停转、原姿态重试或重新找正后重试')
+    assembly.add_argument('--strip-depth', type=float, metavar='MM', help='滑牙工况中承载牙段结束的深度')
     build = commands.add_parser('build-station', help='从真实示教点生成 PolyScope 5 脚本')
     build.add_argument('--station', type=Path, required=True)
     build.add_argument('--output', type=Path, required=True)
@@ -113,6 +115,10 @@ def main():
     thread_study.add_argument('--profile', type=Path, default=SAMPLES / 'profile.json')
     thread_study.add_argument('--output', type=Path, default=OUTPUT / 'cross-thread' / 'study')
     thread_study.add_argument('--jobs', type=int, default=1)
+    health_study = commands.add_parser('thread-health-study', help='核对正常、斜咬牙、牙侧损伤及滑牙的判定')
+    health_study.add_argument('--profile', type=Path, default=SAMPLES / 'profile.json')
+    health_study.add_argument('--output', type=Path, default=OUTPUT / 'thread-health' / 'study')
+    health_study.add_argument('--jobs', type=int, default=1)
     accept = commands.add_parser('evaluate', help='根据独立真值记录核对 20 轮报告')
     accept.add_argument('--manifest', type=Path, required=True)
     accept.add_argument('--source', choices=('hardware', 'simulation'), default='hardware')
@@ -162,6 +168,7 @@ def main():
                                   insertion=args.insertion, entry_offset_mm=args.entry_offset,
                                   entry_offset_site=args.entry_offset_site or fault_site,
                                   entry_tilt_deg=args.entry_tilt, recovery=args.recovery,
+                                  strip_depth_mm=args.strip_depth,
                                   viewer=args.viewer, video=args.video)
             if result is not None:
                 return 0 if result[1]['status'] == 'pass' else 1
@@ -221,6 +228,12 @@ def main():
 
             folder, result = run_thread_study(args.profile.resolve(), args.output.resolve(), args.jobs)
             print(f'斜咬牙恢复对比 {result["correct"]}/{result["rounds"]} · {folder / "report.html"}')
+            return 0 if result['passed'] else 1
+        elif args.action == 'thread-health-study':
+            from .thread_health_study import run_health_study
+
+            folder, result = run_health_study(args.profile.resolve(), args.output.resolve(), args.jobs)
+            print(f'牙损判定 {result["correct"]}/{result["rounds"]} · 坏牙误放行 {result["false_pass"]} · {folder / "report.html"}')
             return 0 if result['passed'] else 1
         elif args.action in ('evaluate', 'simulate-acceptance'):
             if args.action == 'evaluate':

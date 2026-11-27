@@ -70,9 +70,11 @@ def verify(trial, mode, result, folder, events):
             return False
     else:
         code = 'thread_jam' if mode == 'stop' else 'jam_retry_limit'
-        if (result['status'] != 'aborted' or result['stop_code'] != code
+        outcome = 'aborted' if mode == 'stop' else 'review'
+        stop_event = 'spindle_stopped_after_abort' if mode == 'stop' else 'spindle_stopped_for_review'
+        if (result['status'] != outcome or result['stop_code'] != code
                 or installed != list(SITES[:SITES.index(trial.site)]) or result['inspection_started_at_s'] is not None
-                or result['inspection_report'] or 'torque_cutoff' in names or 'spindle_stopped_after_abort' not in names):
+                or result['inspection_report'] or 'torque_cutoff' in names or stop_event not in names):
             return False
     if not trial.jam:
         return len(entries) == 1 and not jams and 'retry_retracted' not in names
@@ -115,7 +117,7 @@ def evaluate(trial, mode, profile, root):
 
 def write_dashboard(folder, study):
     def describe(row):
-        outcome = '三颗合格' if row['observed'] == 'pass' else '中止'
+        outcome = {'pass': '三颗合格', 'review': '待复检'}.get(row['observed'], '中止')
         details = f' · 退牙 {row["reversed"]} 次' if row['reversed'] else ''
         if row['corrected_tilt_deg'] is not None:
             details += f' · 扶正至 {row["corrected_tilt_deg"]:.2f}°'

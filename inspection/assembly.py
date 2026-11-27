@@ -13,10 +13,11 @@ from .force_insertion import (CONTACT_DT_S, FORCE_ENTRY_TOLERANCE_M, INSERTION_M
 from .simulation import FAULTS, MODELS, Simulation, compile_model
 from .thread_contact import (FLANK_DRAG_ARM_M, MAX_ANGLED_ENTRY_DEG, REALIGN_TILT_DEG, RECOVERY_MODES, THREAD_PITCH_MM,
                              add_thread_flanks, initial_axis, rotation_without_yaw)
+from .thread_health import DAMAGE_FAULTS, SlipMonitor, stripped_thread_forces
 from .vision_alignment import ALIGNMENT_FAULTS, HOLE_PLANE_Z_M, FixtureShift, Pinhole, find_hole, fit_fixture, mask_observation
 
 
-ASSEMBLY_FAULTS = ('none', 'misaligned', *OBSTRUCTION_FAULTS, 'cross_thread', 'empty_feeder')
+ASSEMBLY_FAULTS = ('none', 'misaligned', *OBSTRUCTION_FAULTS, 'cross_thread', *DAMAGE_FAULTS, 'empty_feeder')
 MOTION_PROFILES = ('optimized', 'baseline')
 ALIGNMENT_MODES = ('fixed', 'vision')
 DEPTH_M = 0.006
@@ -49,8 +50,11 @@ def set_position(element, x=None, y=None):
 def assembly_model(fault, stations, fault_site, conditions, fixture_shift, alignment, insertion):
     scene = ET.parse(MODELS / 'inspection.xml').getroot()
     extra = ET.parse(MODELS / 'assembly.xml').getroot()
-    title = 'UR5e cross-thread recovery' if fault == 'cross_thread' else 'UR5e force-guided assembly' if insertion == 'force' else (
-        'UR5e vision-guided assembly' if alignment == 'vision' else 'UR5e screw assembly')
+    normal_title = ('UR5e force-guided assembly' if insertion == 'force' else
+                    'UR5e vision-guided assembly' if alignment == 'vision' else 'UR5e screw assembly')
+    fault_titles = dict.fromkeys(DAMAGE_FAULTS, 'UR5e thread damage inspection')
+    fault_titles['cross_thread'] = 'UR5e cross-thread recovery'
+    title = fault_titles.get(fault, normal_title)
     scene.set('model', title)
     scene.find('option').set('timestep', '0.0005')
     world = scene.find('worldbody')
@@ -89,9 +93,10 @@ def assembly_model(fault, stations, fault_site, conditions, fixture_shift, align
                 set_position(element, feeder_x + dx / 1000, (-0.339 if empty else -0.236) + dy / 1000)
                 for i, slot in enumerate(element.findall("geom[@class='slot']")):
                     slot.set('euler', f'0 0 {0.2 + 0.3 * index + i * math.pi / 2:.6f}')
-                if fault == 'cross_thread' and station == fault_site:
+                if fault in ('cross_thread', 'damaged_thread') and station == fault_site:
                     guide = extra.find("worldbody/body[@name='thread_guide']")
-                    add_thread_flanks(scene.find('asset'), world, element, xy, float(guide.get('pos').split()[2]))
+                    add_thread_flanks(scene.find('asset'), world, element, xy, float(guide.get('pos').split()[2]),
+                                      crushed=fault == 'damaged_thread')
             if name == 'blocked_seat' and fault == 'retryable_jam':
                 holder = ET.SubElement(world, 'body', name=f'jam_fixture_{station}', mocap='true')
                 holder.append(element)
@@ -119,8 +124,23 @@ class AssemblyStopped(RuntimeError):
         self.code = code
 
 
-class InsertionJammed(AssemblyStopped):
-    pass
+class AssemblyReview(AssemblyStopped):
+    """Fastening failed a quality gate and the assembly requires inspection."""
+
+
+class InsertionAnomaly(AssemblyStopped):
+    attempt_status = 'unverified'
+    review_code = 'thread_signature_unverified'
+
+
+class InsertionJammed(InsertionAnomaly):
+    attempt_status = 'jammed'
+    review_code = 'jam_retry_limit'
+
+
+class InsertionSlipped(InsertionAnomaly):
+    attempt_status = 'slipped'
+    review_code = 'thread_slip_retry_limit'
 
 
 @dataclass(frozen=True)
@@ -141,13 +161,15 @@ class Station:
     entry_actual: np.ndarray
     flank_pairs: frozenset
     thread_entry: int
+    depth_dof: int
+    pitch: int
 
 
 class Assembly(Simulation):
     def __init__(self, fault='none', sites=SITES, fault_site='S2', *, seed=0, image_fault='none', image_site='S2',
                  motion='optimized', alignment='fixed', fixture_shift=FixtureShift(), alignment_fault='none',
                  alignment_fault_site='S2', insertion='fixed', entry_offset_mm=(0.0, 0.0), entry_offset_site='S2',
-                 recovery='realign', entry_tilt_deg=None):
+                 recovery='realign', entry_tilt_deg=None, strip_depth_mm=None):
         if fault not in ASSEMBLY_FAULTS:
             raise ValueError(f'未知装配工况 {fault}')
         self.sites = tuple(sites)
@@ -169,15 +191,22 @@ class Assembly(Simulation):
             raise ValueError(f'未知对孔方式 {insertion}')
         if recovery not in RECOVERY_MODES:
             raise ValueError(f'未知重试方式 {recovery}')
-        if fault == 'cross_thread' and insertion != 'force':
-            raise ValueError('斜咬牙试验使用相同的力反馈入孔，只改变重试控制')
-        if entry_tilt_deg is not None and fault != 'cross_thread':
-            raise ValueError('入口倾角只用于斜咬牙试验')
+        if fault in ('cross_thread', *DAMAGE_FAULTS) and insertion != 'force':
+            raise ValueError('斜咬牙和牙损试验需要力反馈入孔')
+        if strip_depth_mm is not None and fault != 'stripped_thread':
+            raise ValueError('滑牙起始深度只用于滑牙工况')
+        if fault == 'stripped_thread':
+            strip_depth_mm = 2.4 if strip_depth_mm is None else strip_depth_mm
+            if not 1.3 <= strip_depth_mm <= 4.2:
+                raise ValueError('滑牙起始深度须在 1.3 至 4.2 mm')
+        self.strip_depth_mm = strip_depth_mm
+        if entry_tilt_deg is not None and fault not in ('cross_thread', 'damaged_thread'):
+            raise ValueError('入口倾角可用于斜咬牙和牙侧损伤试验')
         tilt = np.asarray((5.25, 0) if entry_tilt_deg is None else entry_tilt_deg, dtype=float)
         if (tilt.shape != (2,) or not np.isfinite(tilt).all() or np.linalg.norm(tilt) > MAX_ANGLED_ENTRY_DEG):
             raise ValueError('入口倾角的 XY 合计幅值不得超过 6°')
         self.recovery = recovery
-        self.entry_tilt_deg = tilt.tolist() if fault == 'cross_thread' else None
+        self.entry_tilt_deg = tilt.tolist() if fault == 'cross_thread' or entry_tilt_deg is not None else None
         offset = np.asarray(entry_offset_mm, dtype=float)
         if (offset.shape != (2,) or not np.isfinite(offset).all() or np.linalg.norm(offset) > 5
                 or (np.any(offset) and entry_offset_site not in self.sites)):
@@ -231,7 +260,9 @@ class Assembly(Simulation):
                               model.equality(f'magnetic_bit_{site}').id, model.equality(f'thread_capture_{site}').id,
                               model.equality(f'keyed_drive_{site}').id, turn, dof, float(model.dof_damping[dof]),
                               nominal, taught, actual, flank_pairs if site == fault_site else frozenset(),
-                              model.site(f'thread_entry_{site}').id)
+                              model.site(f'thread_entry_{site}').id,
+                              int(model.joint(f'thread_depth_{site}').dofadr[0]),
+                              model.equality(f'thread_pitch_{site}').id)
             self.stations[site] = station
             self.allowed_pairs.update(frozenset((station.head, geom)) for geom in (
                 self.bit, self.plate, block, model.geom(f'feeder_seat_{site}').id, model.geom(f'feeder_base_{site}').id,
@@ -253,16 +284,36 @@ class Assembly(Simulation):
         self.station = self.stations[self.sites[0]]
         self.force_zero = np.zeros(3)
         self.attempt = 0
+        self.angle_origin = None
         self.results = {site: dict(status='pending', after_retract=None, torque_cutoff=None, peak_torque_nm=0.0,
-                                   peak_seat_force_n=0.0, attempts=[]) for site in self.sites}
+                                   peak_seat_force_n=0.0, thread_diagnosis=None, attempts=[]) for site in self.sites}
         for station in self.stations.values():
             self.model.dof_damping[station.turn_dof] = station.free_damping
             self.model.eq_data[station.key, 0] = 0
             self.model.site_quat[station.thread_entry] = (1, 0, 0, 0)
         self.reset(self.sites, self.image_fault, self.image_site, self.seed)
+        if self.strip_depth_mm is not None:
+            damaged = self.stations[self.mechanical_fault_site]
+            self.data.eq_active[damaged.pitch] = False
         if self.jam_mocap is not None:
             self.data.mocap_pos[self.jam_mocap, 2] = -0.040
             mujoco.mj_forward(self.model, self.data)
+
+    def step(self):
+        if self.strip_depth_mm is not None:
+            station = self.stations[self.mechanical_fault_site]
+            axial, spin = 0.0, 0.0
+            if self.data.eq_active[station.guide]:
+                depth_joint = self.model.dof_jntid[station.depth_dof]
+                axial, spin = stripped_thread_forces(
+                    float(self.data.joint(station.turn_joint).qpos[0]),
+                    float(self.data.joint(depth_joint).qpos[0]),
+                    float(self.data.qvel[station.turn_dof]), float(self.data.qvel[station.depth_dof]),
+                    self.strip_depth_mm / 1000,
+                )
+            self.data.qfrc_applied[station.depth_dof] = axial
+            self.data.qfrc_applied[station.turn_dof] = spin
+        super().step()
 
     def check_contacts(self):
         for contact in self.data.contact:
@@ -302,6 +353,10 @@ class Assembly(Simulation):
         force = self.tool_force()
         moment = self.load_vector(self.torque_sensor)
         tool_axis = data.site_xmat[self.reference].reshape(3, 3)[:, 2]
+        encoder_depth = 1000 * (station.entry_nominal[2] + self.model.site(station.socket).pos[2] - tip[2])
+        spindle_angle = float(data.joint(self.spindle_joint).qpos[0])
+        drive_turns = ((spindle_angle - self.angle_origin) / math.tau
+                       if self.angle_origin is not None and station is self.station else None)
         return dict(sim_time_s=float(data.time), stage=self.stage, site=station.name,
                     attempt=self.attempt, tool_fx_n=float(force[0]), tool_fy_n=float(force[1]),
                     tool_fz_n=float(force[2]), tool_lateral_n=float(np.linalg.norm(force[:2])),
@@ -313,9 +368,10 @@ class Assembly(Simulation):
                     radial_error_mm=float(1000 * np.linalg.norm(position[:2] - station.entry_actual[:2])),
                     tilt_deg=math.degrees(math.acos(float(np.clip(normal[2], -1, 1)))),
                     insertion_depth_mm=float(1000 * depth),
+                    encoder_depth_mm=float(encoder_depth), drive_turns=drive_turns,
                     thread_turns=float(data.joint(station.turn_joint).qpos[0] / (2 * math.pi)),
                     spindle_velocity_command_rad_s=float(data.ctrl[self.motor]),
-                    spindle_angle_rad=float(data.joint(self.spindle_joint).qpos[0]),
+                    spindle_angle_rad=spindle_angle,
                     spindle_velocity_rad_s=float(data.joint(self.spindle_joint).qvel[0]),
                     spindle_torque_nm=float(abs(data.actuator_force[self.motor])),
                     seat_force_n=self.normal_force(station, self.plate),
@@ -414,6 +470,9 @@ class Assembly(Simulation):
             result['status'] = 'working'
             try:
                 result.update(after_retract=self.install_one(station), status='installed')
+            except AssemblyReview:
+                result['status'] = 'review'
+                raise
             except RuntimeError:
                 result['status'] = 'failed'
                 raise
@@ -437,6 +496,7 @@ class Assembly(Simulation):
 
     def install_one(self, station):
         self.attempt = 0
+        self.angle_origin = None
         self.force_zero[:] = 0
         feed = station.screw_nominal.copy()
         feed[2] += self.model.site(station.socket).pos[2]
@@ -544,9 +604,12 @@ class Assembly(Simulation):
 
     def insert_and_tighten(self, station, goal):
         approach = goal
-        rotation = initial_axis(self.entry_tilt_deg) if station.flank_pairs else np.eye(3)
-        attempts = self.results[station.name]['attempts']
+        angled_injection = self.entry_tilt_deg is not None and station.name == self.mechanical_fault_site
+        rotation = initial_axis(self.entry_tilt_deg) if angled_injection else np.eye(3)
+        result = self.results[station.name]
+        attempts = result['attempts']
         for self.attempt in range(1, MAX_ATTEMPTS + 1):
+            self.angle_origin = None
             attempt = dict(number=self.attempt, status='probing')
             attempts.append(attempt)
             self.event('insertion_attempt')
@@ -564,23 +627,37 @@ class Assembly(Simulation):
                 retreat[2] = goal[2] + 0.016
                 self.move_xyz('retry_retract', retreat, speed=0.24)
                 self.event('probe_retracted')
+                if self.attempt > 1:
+                    result['thread_diagnosis'] = 'retry_entry_unverified'
+                    raise AssemblyReview('退牙后重新找孔失败，等待复检', 'thread_retry_entry') from exc
                 raise
             attempt['status'] = 'driving'
             try:
                 self.tighten(station)
-            except InsertionJammed as exc:
-                attempt.update(status='jammed', reason=str(exc))
+            except InsertionAnomaly as exc:
+                attempt.update(status=exc.attempt_status, reason=str(exc))
+                result['thread_diagnosis'] = exc.review_code
                 if self.recovery == 'stop':
                     raise
-                self.recover_thread(station, approach, rotation)
+                try:
+                    self.recover_thread(station, approach, rotation)
+                except AssemblyStopped as unwind:
+                    raise AssemblyReview(f'旋入异常，退牙未完成：{unwind}', unwind.code) from unwind
                 if self.attempt == MAX_ATTEMPTS:
-                    raise AssemblyStopped('两次旋入均卡滞，已停转退回，等待复检', 'jam_retry_limit') from exc
+                    raise AssemblyReview(f'复试仍异常，已停转退回，等待复检。{exc}', exc.review_code) from exc
                 if self.recovery == 'realign':
                     rotation = self.realign_after_jam(approach, rotation)
                 if self.jam_mocap is not None:
                     self.clear_simulated_chip(station)
+            except AssemblyStopped as exc:
+                if self.attempt > 1:
+                    attempt.update(status='unverified', reason=str(exc))
+                    result['thread_diagnosis'] = 'thread_signature_unverified'
+                    raise AssemblyReview(f'复试触发装配保护，等待复检。{exc}', exc.code) from exc
+                raise
             else:
                 attempt['status'] = 'seated'
+                result['thread_diagnosis'] = 'recovered_after_retry' if self.attempt > 1 else 'normal'
                 return approach
 
     def engage_thread(self, station):
@@ -602,6 +679,7 @@ class Assembly(Simulation):
                                               - self.data.joint(station.turn_joint).qpos[0])
         self.data.eq_active[station.guide] = True
         self.data.eq_active[station.key] = True
+        self.angle_origin = float(self.data.joint(self.spindle_joint).qpos[0])
         self.event('thread_engaged')
         if self.jam_mocap is not None and station.name == self.mechanical_fault_site and self.attempt <= 1:
             self.data.mocap_pos[self.jam_mocap, 2] = 0.0
@@ -620,7 +698,7 @@ class Assembly(Simulation):
         self.event('unwind_started')
         reverse_measured = False
         try:
-            for _ in range(round(4 / self.model.opt.timestep)):
+            for _ in range(round(6 / self.model.opt.timestep)):
                 angle = float(encoder[0]) - entry_angle
                 if abs(angle) <= 0.07:
                     break
@@ -701,8 +779,11 @@ class Assembly(Simulation):
         steady = 0
         stalled = 0
         stall_begin_travel = 0.0
+        stall_begin_angle = 0.0
         tip_at_entry = float(self.data.site_xpos[self.tip, 2])
         dt = self.model.opt.timestep
+        monitor = SlipMonitor()
+        monitor_stride = max(1, round(0.010 / dt))
         bearing_arm = BEARING_FRICTION_ARM_M * self.conditions[station.name]['bearing_scale']
         try:
             for step in range(round(8 / dt)):
@@ -729,17 +810,29 @@ class Assembly(Simulation):
                 rate = abs(float(self.data.qvel[station.turn_dof]))
                 if self.insertion == 'force':
                     tip_travel = tip_at_entry - sample['tip_z_m']
+                    angle = sample['spindle_angle_rad']
+                    if step % monitor_stride == 0:
+                        slip = monitor.observe(angle, sample['encoder_depth_mm'], torque)
+                        if slip:
+                            self.event('thread_slip_detected', **slip)
+                            raise InsertionSlipped(
+                                f"电批转过 {slip['window_turns']:.2f} 圈，深度仅增加 {slip['window_advance_mm']:.2f} mm",
+                                'thread_slip')
                     loaded = (abs(sample['tool_fz_n']) >= 2.5 or sample['tool_lateral_n'] >= 1.7
                               or math.hypot(sample['tool_mx_nm'], sample['tool_my_nm']) >= 0.012)
                     early_stall = (tip_travel < DEPTH_M - 0.00075 and loaded
                                    and torque >= 0.155 and abs(sample['spindle_velocity_rad_s']) <= 0.8)
-                    if not early_stall or abs(tip_travel - stall_begin_travel) > 0.00012:
+                    if (not early_stall or abs(tip_travel - stall_begin_travel) > 0.00012
+                            or abs(angle - stall_begin_angle) > 0.12):
                         stalled = 0
                         stall_begin_travel = tip_travel
+                        stall_begin_angle = angle
                     if early_stall:
                         stalled += 1
                     if stalled >= round(0.085 / dt):
                         self.event('jam_detected', sensed_torque_nm=torque, sensed_tip_travel_mm=1000 * tip_travel,
+                                   window_turns=(angle - stall_begin_angle) / math.tau,
+                                   window_advance_mm=1000 * (tip_travel - stall_begin_travel),
                                    jam_trigger='stall')
                         raise InsertionJammed(f'入座前扭矩升高且进给停滞，批头进给 {1000 * tip_travel:.2f} mm',
                                              'thread_jam')
@@ -757,14 +850,21 @@ class Assembly(Simulation):
                 seated = (abs(depth - DEPTH_M * 1000) <= 0.6 and pitch_error <= 0.25 and force >= 4.0
                           and sample['tilt_deg'] <= ENGAGE_TILT_DEG and rate <= 0.7
                           and TORQUE_TARGET_NM <= torque <= TORQUE_MAX_NM + 1e-6)
+                if self.insertion == 'force':
+                    encoder_depth = sample['encoder_depth_mm']
+                    seated = (seated and abs(encoder_depth - DEPTH_M * 1000) <= 0.6
+                              and abs(encoder_depth - PITCH_MM * sample['drive_turns']) <= 0.45)
                 steady = steady + 1 if seated else 0
                 if steady >= round(0.10 / dt):
                     result['torque_cutoff'] = {**sample, 'thread_rate_rad_s': rate}
                     self.event('torque_cutoff')
                     return
             final = self.snapshot()
-            raise AssemblyStopped(f"旋紧未达到联合门限，深度 {final['insertion_depth_mm']:.2f} mm，"
-                                  f"扭矩 {final['spindle_torque_nm']:.3f} N·m，入座力 {final['seat_force_n']:.1f} N",
-                                  'torque_gate')
+            message = (f"旋紧未达到联合门限，深度 {final['encoder_depth_mm']:.2f} mm，"
+                       f"扭矩 {final['spindle_torque_nm']:.3f} N·m，入座力 {final['seat_force_n']:.1f} N")
+            if self.insertion == 'force':
+                self.event('thread_signature_unverified')
+                raise InsertionAnomaly(message, 'torque_gate')
+            raise AssemblyStopped(message, 'torque_gate')
         finally:
             self.data.ctrl[self.motor] = 0.0

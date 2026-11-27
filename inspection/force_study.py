@@ -35,7 +35,7 @@ EXPECTED = {
     'nominal': ('pass', 'pass'),
     'offset': ('aborted', 'pass'),
     'retryable': ('aborted', 'pass'),
-    'blocked': ('aborted', 'aborted'),
+    'blocked': ('aborted', 'review'),
     'outside': ('aborted', 'aborted'),
 }
 
@@ -72,7 +72,8 @@ def evidence(trial, mode, expected, result, folder):
         if result['inspection_started_at_s'] < last_release or not optical_evidence(Case(trial.label, trial.seed), result, folder):
             return False
     elif (installed != list(SITES[:SITES.index(trial.site)]) or result['inspection_started_at_s'] is not None
-          or result['inspection_report'] or 'torque_cutoff' in names or 'spindle_stopped_after_abort' not in names):
+          or result['inspection_report'] or 'torque_cutoff' in names
+          or ('spindle_stopped_for_review' if expected == 'review' else 'spindle_stopped_after_abort') not in names):
         return False
     if mode == 'fixed':
         stop_code = {'offset': 'alignment', 'outside': 'alignment', 'retryable': 'obstruction', 'blocked': 'obstruction'}
@@ -121,7 +122,7 @@ def evaluate(trial, mode, profile, root):
 
 def write_dashboard(folder, study):
     def describe(row):
-        terms = ['完成三颗并通过质检' if row['observed'] == 'pass' else '中止']
+        terms = [{'pass': '完成三颗并通过质检', 'review': '待复检'}.get(row['observed'], '中止')]
         if row['recovered']:
             terms.append(f'{row["recovered"]} 次停转退牙')
         if row['correction_mm'] >= 0.05 and row['entry_mm'] is not None:

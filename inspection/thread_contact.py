@@ -23,20 +23,23 @@ def initial_axis(tilt_deg):
     return rotation_without_yaw(np.array([math.cos(x) * math.sin(y), -math.sin(x), math.cos(x) * math.cos(y)]))
 
 
-def tooth_sectors(assets, parent, prefix, profile, first_z, turns, xy, *, male):
+def tooth_sectors(assets, parent, prefix, profile, first_z, turns, xy, *, male, crushed=False):
     """Convex flank segments follow the same helix as the pitch constraint."""
     pitch = THREAD_PITCH_MM / 1000
     sectors = 12
     for turn in range(turns):
         for sector in range(sectors):
+            damaged = crushed and turn == turns - 1 and sector in (1, 2, 3, 4)
+            tooth = ((.00548, -.00078), (.00358, -.00030), (.00358, .00028),
+                     (.00548, .00078)) if damaged else profile
             start = math.tau * sector / sectors
             end = math.tau * (sector + 1) / sectors
             vertices = [
                 (radius * math.cos(angle), radius * math.sin(angle), offset + pitch * angle / math.tau)
-                for angle in (start, end) for radius, offset in profile
+                for angle in (start, end) for radius, offset in tooth
             ]
-            name = f'{prefix}_{sector}'
-            if turn == 0:
+            name = f'{prefix}_{sector}' + ('_crushed' if damaged else '')
+            if turn == 0 or damaged:
                 ET.SubElement(assets, 'mesh', name=name, vertex=' '.join(
                     f'{value:.9f}' for vertex in vertices for value in vertex))
             ET.SubElement(parent, 'geom', name=f'{name}_{turn}', type='mesh', mesh=name,
@@ -46,10 +49,11 @@ def tooth_sectors(assets, parent, prefix, profile, first_z, turns, xy, *, male):
                           rgba='0 0 0 0', group='3')
 
 
-def add_thread_flanks(assets, world, screw, xy, entry_z):
+def add_thread_flanks(assets, world, screw, xy, entry_z, *, crushed=False):
     # The roots are wide enough to preserve flank contact under a tilted start.
     male = ((.00372, -.00078), (.00461, -.00026), (.00461, .00026), (.00372, .00078))
     female = ((.00548, -.00078), (.00420, -.00028), (.00420, .00028), (.00548, .00078))
     male_start = -.01265
     tooth_sectors(assets, screw, 'male_flank', male, male_start, 2, (0, 0), male=True)
-    tooth_sectors(assets, world, 'female_flank', female, entry_z + male_start - .011, 4, xy, male=False)
+    tooth_sectors(assets, world, 'female_flank', female, entry_z + male_start - .011, 4, xy,
+                  male=False, crushed=crushed)

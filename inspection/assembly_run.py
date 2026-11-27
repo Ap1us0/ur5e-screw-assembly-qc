@@ -9,7 +9,7 @@ import cv2
 import mujoco
 import numpy as np
 
-from .assembly import Assembly, AssemblyStopped, ENGAGE_XY_M, PITCH_MM, TORQUE_TARGET_NM
+from .assembly import Assembly, AssemblyReview, AssemblyStopped, DEPTH_M, ENGAGE_XY_M, PITCH_MM, TORQUE_TARGET_NM
 from .demo import FPS, VIDEO_SIZE, VIEW_SIZE, overlay_text, overview_camera
 from .detector import SITES, save_image
 from .force_insertion import FORCE_ENTRY_TOLERANCE_M
@@ -355,6 +355,51 @@ def plot_thread_contact(folder, rows, events, site):
     return True
 
 
+def plot_fastening_signature(folder, rows, events):
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    samples = [row for row in rows if row['stage'] == 'tighten' and row['drive_turns'] is not None]
+    if not samples:
+        return False
+    sites = tuple(dict.fromkeys(row['site'] for row in samples))
+    fig = Figure(figsize=(max(5.6, 4.4 * len(sites)), 5.4), layout='constrained', facecolor='#f5f8f8')
+    FigureCanvasAgg(fig)
+    grid = fig.subplots(2, len(sites), squeeze=False, sharex='col')
+    colors = {1: '#196775', 2: '#a55384'}
+    markers = {'thread_slip_detected': 'x', 'jam_detected': 'x', 'torque_cutoff': 'o'}
+    for col, site in enumerate(sites):
+        depth, torque = grid[:, col]
+        site_rows = [row for row in samples if row['site'] == site]
+        x_max = max(0.2, max(row['drive_turns'] for row in site_rows)) + 0.06
+        depth.plot((0, x_max), (0, x_max * PITCH_MM), color='#82939b', ls='--', label='Nominal pitch')
+        depth.axhspan(1000 * DEPTH_M - 0.6, 1000 * DEPTH_M + 0.6, color='#dceee6', zorder=0)
+        torque.axhline(TORQUE_TARGET_NM, color='#82939b', ls=':', label='Seating threshold')
+        for attempt in sorted({row['attempt'] for row in site_rows}):
+            selected = [row for row in site_rows if row['attempt'] == attempt]
+            turns = [row['drive_turns'] for row in selected]
+            label = f'Attempt {attempt}'
+            depth.plot(turns, [row['encoder_depth_mm'] for row in selected], color=colors[attempt], label=label)
+            torque.plot(turns, [row['spindle_torque_nm'] for row in selected], color=colors[attempt])
+        for event in events:
+            if event['site'] == site and event['event'] in markers and event['drive_turns'] is not None:
+                t = event['drive_turns']
+                marker, color = markers[event['event']], colors[event['attempt']]
+                depth.scatter(t, event['encoder_depth_mm'], marker=marker, color=color, zorder=3)
+                torque.scatter(t, event['spindle_torque_nm'], marker=marker, color=color, zorder=3)
+        depth.set_title(site, loc='left')
+        depth.set(ylim=(-1.0, max(6.85, x_max * PITCH_MM + 0.2)), xlim=(-0.015, x_max))
+        torque.set(xlabel='Spindle rotation (turns)', ylim=(-0.008, 0.217))
+        if col == 0:
+            depth.set_ylabel('Encoder depth (mm)')
+            torque.set_ylabel('Spindle torque (N·m)')
+        depth.legend(loc='upper left', fontsize=8)
+        for axis in (depth, torque):
+            axis.grid(alpha=.22)
+    fig.savefig(folder / 'fastening_signature.png', dpi=135)
+    return True
+
+
 def write_assembly_report(folder, report):
     write_json(folder / 'assembly.json', report)
     title = {'pass': '装配合格', 'review': '待复检', 'aborted': '装配中止', 'error': '仿真异常'}[report['status']]
@@ -372,16 +417,25 @@ def write_assembly_report(folder, report):
     if report['thread_plot']:
         links.append('<a href="thread_contact.png">斜咬牙和扶正曲线</a>')
         visual = '<img src="thread_contact.png" alt="电批倾斜、牙侧接触力、扭矩、反转速度和旋入深度">' + visual
-    labels = {'installed': '已装配', 'failed': '中止', 'working': '进行中', 'pending': '未装配'}
+    if report['signature_plot']:
+        links.append('<a href="fastening_signature.png">扭矩、转角与深度对照</a>')
+        visual = '<img src="fastening_signature.png" alt="各孔位每次旋入的转角、实测深度和扭矩曲线">' + visual
+    labels = {'installed': '已装配', 'review': '待复检', 'failed': '中止', 'working': '进行中', 'pending': '未装配'}
     rows = []
-    attempt_labels = {'probing': '找正', 'driving': '旋入', 'rejected': '入牙前停机', 'jammed': '卡滞', 'seated': '入座'}
+    attempt_labels = {'probing': '找正', 'driving': '旋入', 'rejected': '入牙前停机', 'jammed': '卡滞',
+                      'slipped': '滑牙特征', 'unverified': '入座未确认', 'seated': '入座'}
+    diagnoses = {None: '—', 'normal': '正常入座', 'recovered_after_retry': '重试后确认入座',
+                 'jam_retry_limit': '持续卡滞，疑似牙损或孔内干涉',
+                 'thread_slip_retry_limit': '持续滑牙特征', 'thread_signature_unverified': '入座未确认',
+                 'retry_entry_unverified': '重新对孔未确认'}
     for site, entry in report['positions'].items():
         retained, cutoff = entry['after_retract'], entry['torque_cutoff']
         depth = f'{retained["insertion_depth_mm"]:.2f} mm' if retained else '—'
         turns = f'{retained["thread_turns"]:.2f}' if retained else '—'
         torque = f'{cutoff["spindle_torque_nm"]:.3f} N·m' if cutoff else '—'
         attempts = ' → '.join(attempt_labels[a['status']] for a in entry['attempts']) or '—'
-        rows.append(f'<tr><th>{site}</th><td>{labels[entry["status"]]}</td><td>{attempts}</td><td>{depth}</td>'
+        diagnosis = diagnoses.get(entry['thread_diagnosis'], '装配异常')
+        rows.append(f'<tr><th>{site}</th><td>{labels[entry["status"]]}</td><td>{attempts}</td><td>{diagnosis}</td><td>{depth}</td>'
                     f'<td>{turns}</td><td>{torque}</td></tr>')
     error = f'<p>{escape(report["error"])}</p>' if report['error'] else ''
     motion_label = {'baseline': '基准运动', 'optimized': '优化运动'}[report['motion']]
@@ -393,8 +447,15 @@ def write_assembly_report(folder, report):
         info = report['thread_model']
         tilt = report['entry_tilt_deg']
         recovery = {'stop': '只停转', 'retry': '原姿态重试', 'realign': '扶正后重试'}[report['recovery']]
-        thread_detail = (f'<p>斜咬牙试验 · 入牙倾角 ({tilt[0]:g}°, {tilt[1]:g}°) · {recovery} · '
+        condition = '斜咬牙试验' if report['scenario'] == 'cross_thread' else '固定牙侧损伤试验'
+        if tilt is not None:
+            condition += f' · 入牙倾角 ({tilt[0]:g}°, {tilt[1]:g}°)'
+        thread_detail = (f'<p>{condition} · {recovery} · '
                          f'固定内牙 {info["female_flanks"]} 段 · 挡块 {info["obstruction_geoms"]} 个。</p>')
+    if report['strip_depth_mm'] is not None:
+        thread_detail = f'<p>滑牙试验 · 承载牙段至 {report["strip_depth_mm"]:g} mm · 两次尝试使用同一损伤模型。</p>'
+    if report['review_photo']:
+        links.append(f'<a href="{report["review_photo"]}">复检停机现场图</a>')
     if report['alignment'] == 'vision':
         write_registration_report(folder, report)
         links.append('<a href="registration.html">三孔定位原图与估计结果</a>')
@@ -408,7 +469,7 @@ def write_assembly_report(folder, report):
 main{{max-width:1080px;margin:auto;padding:28px 18px}}h1{{margin:.15em 0}}p{{margin:10px 0}}
 table{{width:100%;border-collapse:collapse;background:#fff}}th,td{{padding:7px;text-align:left;border-bottom:1px solid #d8e3e5}}
 video,img{{display:block;width:100%;border-radius:8px;margin-top:18px}}a{{color:#165669}}</style>
-<main><p>MuJoCo · UR5e</p><h1>{title}</h1><p>{duration}</p>{thread_detail}{alignment}{error}<table><tr><th>位置</th><th>结果</th><th>装配尝试</th><th>撤刀后深度</th>
+<main><p>MuJoCo · UR5e</p><h1>{title}</h1><p>{duration}</p>{thread_detail}{alignment}{error}<table><tr><th>位置</th><th>结果</th><th>装配尝试</th><th>拧紧判定</th><th>撤刀后深度</th>
 <th>圈数</th><th>停转扭矩</th></tr>{''.join(rows)}</table><p>{' · '.join(links)}</p>{visual}</main></html>'''
     (folder / 'report.html').write_text(page, encoding='utf-8')
 
@@ -446,12 +507,13 @@ def run_round(rig, detector, output, viewer, record):
     female = rig.female_flanks
     fixed_xpos = rig.data.geom_xpos[female].copy()
     fixed_xmat = rig.data.geom_xmat[female].copy()
-    result = dict(version=4, source='simulation', scenario=rig.scenario,
+    result = dict(version=5, source='simulation', scenario=rig.scenario,
                   fault_site=rig.mechanical_fault_site if rig.scenario != 'none' else None,
                   seed=rig.seed, image_fault=rig.image_fault, image_site=rig.image_site, conditions=rig.conditions,
                   motion=rig.motion, alignment=rig.alignment, fixture_shift_truth=asdict(rig.fixture_shift),
                   insertion=rig.insertion, entry_offset_mm=rig.entry_offset_mm, entry_offset_site=rig.entry_offset_site,
                   entry_tilt_deg=rig.entry_tilt_deg, recovery=rig.recovery, external_jam_fixture=rig.jam_mocap is not None,
+                  strip_depth_mm=rig.strip_depth_mm, review_photo=None, mechanical_review_site=None,
                   alignment_fault=rig.alignment_fault, alignment_fault_site=rig.alignment_fault_site,
                   registration=None,
                   order=list(rig.sites), status='error', error=None, stop_code=None, inspection_started_at_s=None,
@@ -502,11 +564,17 @@ def run_round(rig, detector, output, viewer, record):
             rig.verify_all_retained()
         except AssemblyStopped as exc:
             message = str(exc) if exc.code == 'registration_fit' else f'{rig.station.name} · {exc}'
-            result.update(status='aborted', stop_code=exc.code, error=message)
-            rig.event('aborted')
+            review = isinstance(exc, AssemblyReview)
+            result.update(status='review' if review else 'aborted', stop_code=exc.code, error=message,
+                          mechanical_review_site=rig.station.name if review else None)
+            rig.event('mechanical_review' if review else 'aborted')
             try:
                 rig.brake_spindle()
-                rig.event('spindle_stopped_after_abort')
+                rig.event('spindle_stopped_for_review' if review else 'spindle_stopped_after_abort')
+                if review:
+                    closeup, _ = view.closeup()
+                    result['review_photo'] = 'review_scene.png'
+                    save_image(folder / result['review_photo'], cv2.cvtColor(closeup, cv2.COLOR_RGB2BGR))
             except RuntimeError as brake_error:
                 result.update(status='error', error=f'{exc} / {brake_error}')
         except RuntimeError as exc:
@@ -521,6 +589,7 @@ def run_round(rig, detector, output, viewer, record):
                   final={site: rig.snapshot(station) for site, station in rig.stations.items()})
     result['thread_model'] = dict(
         female_flanks=len(female), all_world_geoms=bool(np.all(rig.model.geom_bodyid[female] == 0)),
+        damaged_flanks=sum('_crushed_' in rig.model.geom(geom).name for geom in female),
         unchanged=bool(np.array_equal(fixed_xpos, rig.data.geom_xpos[female])
                        and np.array_equal(fixed_xmat, rig.data.geom_xmat[female])),
         mocap_bodies=int(rig.model.nmocap), obstruction_geoms=sum(s.block >= 0 for s in rig.stations.values()),
@@ -531,6 +600,7 @@ def run_round(rig, detector, output, viewer, record):
     result['plot'] = plot_trace(folder, view.rows)
     result['force_plot'] = rig.insertion == 'force' and plot_force_trace(folder, view.rows, rig.events)
     result['thread_plot'] = bool(female) and plot_thread_contact(folder, view.rows, rig.events, rig.mechanical_fault_site)
+    result['signature_plot'] = rig.insertion == 'force' and plot_fastening_signature(folder, view.rows, rig.events)
     result['video'] = record and (folder / 'assembly.mp4').stat().st_size > 0
     write_assembly_report(folder, result)
     print(f'{RESULTS[result["status"]]} · {folder / "report.html"}', flush=True)
@@ -543,7 +613,7 @@ def run_assembly(detector, output, fault, *, sites=SITES, fault_site='S2', seed=
                  image_site='S2', motion='optimized', alignment='fixed', fixture_shift=FixtureShift(),
                  alignment_fault='none', alignment_fault_site='S2', viewer=False, video=False,
                  insertion='fixed', entry_offset_mm=(0.0, 0.0), entry_offset_site='S2',
-                 recovery='realign', entry_tilt_deg=None):
+                 recovery='realign', entry_tilt_deg=None, strip_depth_mm=None):
     if detector.source != 'simulation':
         raise ValueError('装配演示需要仿真检测配置')
     start, open_report = threading.Event(), threading.Event()
@@ -559,7 +629,7 @@ def run_assembly(detector, output, fault, *, sites=SITES, fault_site='S2', seed=
                        motion=motion, alignment=alignment, fixture_shift=fixture_shift,
                        alignment_fault=alignment_fault, alignment_fault_site=alignment_fault_site,
                        insertion=insertion, entry_offset_mm=entry_offset_mm, entry_offset_site=entry_offset_site,
-                       recovery=recovery, entry_tilt_deg=entry_tilt_deg)
+                       recovery=recovery, entry_tilt_deg=entry_tilt_deg, strip_depth_mm=strip_depth_mm)
         resources.callback(rig.close)
         if not viewer:
             return run_round(rig, detector, output, None, video)

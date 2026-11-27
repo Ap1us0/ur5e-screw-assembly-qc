@@ -39,4 +39,4 @@ class ForceInsertionTests(unittest.TestCase):
             self.assertTrue(retraction_verified(rig.events, 1))
             self.assertTrue(retraction_verified(rig.events, 2))
             self.assertIsNone(rig.results['S2']['torque_cutoff'])
-            self.assertEqual(rig.results['S2']['status'], 'failed')
+            self.assertEqual(rig.results['S2']['status'], 'review')
