@@ -49,6 +49,24 @@ $inspectionPython = '.\.venv\Scripts\python.exe'
 
 `assembly-acceptance` 运行固定的 20 轮装配与质检闭环工况，验收门槛为至少 18 轮判定正确且证据齐全，并且零误放行。10 轮预期合格，2 轮预期待复检，8 轮预期装配中止。输出在 `outputs/assembly-acceptance/<批次>`，包括预期清单、实际统计、逐轮照片、装配事件、旋入曲线和电批停转记录。工况覆盖供料偏移、对孔偏差、入座摩擦扰动、单视角反光或模糊、双视角不可判、空供料位和孔口障碍。非零 `--seed` 对每个位置复现 XY 偏移、摩擦和成像扰动。`--image-fault` 与 `--image-site` 仅作用于装配后的统一质检。仿真验证范围见结项报告，实物标定与 20 轮实机验收各自留档。
 
+## 仿真节拍优化
+
+装配默认使用 `--motion optimized`。关节参考从三次曲线改为五次曲线，使起终点速度和加速度均为零。根据 MuJoCo 模型执行器的速度阻尼添加位置指令前馈 `u = q_ref + (Kd/Kp) × dq_ref`，减少跟踪滞后和到位等待。规划仍约束原有参考角速度峰值，增加参考角加速度上限，发给执行器的指令受模型限位约束。位置和速度稳定门限、碰撞检查、旋紧、停转、留置和视觉判定规则沿用原参数。使用 `--motion baseline` 可复跑原三次曲线。优化仅作用于装配仿真及其末尾的巡检。
+
+```powershell
+& $inspectionPython -m inspection assembly-acceptance --motion baseline --jobs 3 --output outputs/motion-optimization/baseline
+& $inspectionPython -m inspection assembly-acceptance --motion optimized --jobs 3 --output outputs/motion-optimization/optimized
+$baseline = Get-ChildItem outputs/motion-optimization/baseline/*/acceptance.json | Sort-Object LastWriteTime | Select-Object -Last 1
+$optimized = Get-ChildItem outputs/motion-optimization/optimized/*/acceptance.json | Sort-Object LastWriteTime | Select-Object -Last 1
+& $inspectionPython -m inspection compare-motion --baseline $baseline.FullName --optimized $optimized.FullName
+```
+
+对比程序按工况和种子配对，分别核对两版全部 20 轮的证据与判定，节拍统计采用两版均合格的生产工况。`assembly.json` 中的 `moves` 记录每次关节运动与稳定等待时间、最终角度误差、最终速度。对比输出包括中位数、P95、成对数据与图表，时间为 MuJoCo 仿真时间。
+
+实跑结果中，10 组配对合格工况的整轮中位数从 **48.21 s 降到 28.56 s（缩短 40.8%）**。装配至启动质检的中位数从 39.89 s 降到 24.23 s，所有关节动作到位等待的中位数从 27.35 s 降到 3.96 s。基准与优化各自 20/20 轮判对，均为零误放行。该数据为仿真节拍，实机参数和节拍需现场验证。
+
+![相同工况下的仿真节拍对比](docs/cycle-comparison.png)
+
 ## MuJoCo 纯视觉巡检演示
 
 使用上述 Python 3.12 环境，从项目目录运行以下命令。

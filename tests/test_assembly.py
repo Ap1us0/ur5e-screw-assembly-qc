@@ -26,6 +26,11 @@ class AssemblyTests(unittest.TestCase):
             folder, report = run_round(rig, detector, Path(tmp), None, False)
             self.assertEqual(report['status'], 'pass')
             self.assertEqual(tuple(report['order']), SITES)
+            self.assertEqual(report['motion'], 'optimized')
+            self.assertLess(report['inspection_started_at_s'], report['cycle_time_s'])
+            self.assertTrue(all(move['settled_velocity_rad_s'] < .002 for move in report['moves']))
+            self.assertTrue(all(move['settled_error_rad'] < (.0003 if move['stage'] == 'inspection' else .0018)
+                                for move in report['moves']))
             self.assertEqual([(e['site'], e['event']) for e in report['events']], [
                 (site, event) for site in SITES for event in (
                     'pickup_contact', 'screw_lifted', 'axis_alignment', 'thread_engaged', 'torque_cutoff',

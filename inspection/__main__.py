@@ -62,6 +62,7 @@ def main():
     assembly.add_argument('--seed', type=int, default=0, help='非零种子启用供料、对孔、摩擦和成像扰动')
     assembly.add_argument('--image-fault', choices=('none', 'glare', 'blur', 'both_bad'), default='none')
     assembly.add_argument('--image-site', choices=SITES, default='S2')
+    assembly.add_argument('--motion', choices=('optimized', 'baseline'), default='optimized')
     build = commands.add_parser('build-station', help='从真实示教点生成 PolyScope 5 脚本')
     build.add_argument('--station', type=Path, required=True)
     build.add_argument('--output', type=Path, required=True)
@@ -81,6 +82,11 @@ def main():
     batch.add_argument('--profile', type=Path, default=SAMPLES / 'profile.json')
     batch.add_argument('--output', type=Path, default=OUTPUT / 'assembly-acceptance')
     batch.add_argument('--jobs', type=int, default=1, help='并发仿真进程数')
+    batch.add_argument('--motion', choices=('optimized', 'baseline'), default='optimized')
+    compare = commands.add_parser('compare-motion', help='对比两批相同工况的仿真节拍及判定')
+    compare.add_argument('--baseline', type=Path, required=True)
+    compare.add_argument('--optimized', type=Path, required=True)
+    compare.add_argument('--output', type=Path, default=OUTPUT / 'motion-comparison')
     accept = commands.add_parser('evaluate', help='根据独立真值记录核对 20 轮报告')
     accept.add_argument('--manifest', type=Path, required=True)
     accept.add_argument('--source', choices=('hardware', 'simulation'), default='hardware')
@@ -123,7 +129,7 @@ def main():
             sites = SITES if args.site == 'all' else (args.site,)
             fault_site = args.fault_site or ('S2' if args.site == 'all' else args.site)
             result = run_assembly(Detector(args.profile), args.output, args.fault, sites=sites, fault_site=fault_site,
-                                  seed=args.seed, image_fault=args.image_fault, image_site=args.image_site,
+                                  seed=args.seed, image_fault=args.image_fault, image_site=args.image_site, motion=args.motion,
                                   viewer=args.viewer, video=args.video)
             if result is not None:
                 return 0 if result[1]['status'] == 'pass' else 1
@@ -157,8 +163,14 @@ def main():
         elif args.action == 'assembly-acceptance':
             from .assembly_acceptance import run_acceptance
 
-            folder, result = run_acceptance(args.profile.resolve(), args.output.resolve(), args.jobs)
+            folder, result = run_acceptance(args.profile.resolve(), args.output.resolve(), args.jobs, args.motion)
             print(f'装配闭环 {result["correct"]}/{result["rounds"]} · 误放行 {result["false_pass"]} · {folder / "report.html"}')
+            return 0 if result['passed'] else 1
+        elif args.action == 'compare-motion':
+            from .motion_comparison import compare
+
+            folder, result = compare(args.baseline, args.optimized, args.output)
+            print(f'节拍对比{"通过" if result["passed"] else "未通过"} · {folder / "report.html"}')
             return 0 if result['passed'] else 1
         elif args.action in ('evaluate', 'simulate-acceptance'):
             if args.action == 'evaluate':

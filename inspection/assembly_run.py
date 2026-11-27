@@ -240,13 +240,15 @@ def write_assembly_report(folder, report):
         rows.append(f'<tr><th>{site}</th><td>{labels[entry["status"]]}</td><td>{depth}</td>'
                     f'<td>{turns}</td><td>{torque}</td></tr>')
     error = f'<p>{escape(report["error"])}</p>' if report['error'] else ''
+    motion_label = {'baseline': '基准运动', 'optimized': '优化运动'}[report['motion']]
+    duration = f'{motion_label} · 整轮仿真 {report["cycle_time_s"]:.2f} s'
     page = f'''<!doctype html><html lang="zh-CN"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>UR5e 装配结果</title>
 <style>body{{background:#f3f6f6;color:#193039;font:16px/1.6 "Microsoft YaHei",sans-serif;margin:0}}
 main{{max-width:1080px;margin:auto;padding:28px 18px}}h1{{margin:.15em 0}}p{{margin:10px 0}}
 table{{width:100%;border-collapse:collapse;background:#fff}}th,td{{padding:7px;text-align:left;border-bottom:1px solid #d8e3e5}}
 video,img{{display:block;width:100%;border-radius:8px;margin-top:18px}}a{{color:#165669}}</style>
-<main><p>MuJoCo · UR5e</p><h1>{title}</h1>{error}<table><tr><th>位置</th><th>结果</th><th>撤刀后深度</th>
+<main><p>MuJoCo · UR5e</p><h1>{title}</h1><p>{duration}</p>{error}<table><tr><th>位置</th><th>结果</th><th>撤刀后深度</th>
 <th>圈数</th><th>停转扭矩</th></tr>{''.join(rows)}</table><p>{' · '.join(links)}</p>{visual}</main></html>'''
     (folder / 'report.html').write_text(page, encoding='utf-8')
 
@@ -257,6 +259,7 @@ def run_round(rig, detector, output, viewer, record):
     result = dict(version=2, source='simulation', scenario=rig.scenario,
                   fault_site=rig.mechanical_fault_site if rig.scenario != 'none' else None,
                   seed=rig.seed, image_fault=rig.image_fault, image_site=rig.image_site, conditions=rig.conditions,
+                  motion=rig.motion,
                   order=list(rig.sites), status='error', error=None, stop_code=None, inspection_started_at_s=None,
                   inspection_verdict=None, inspection_report=None)
     with ExitStack() as resources:
@@ -302,7 +305,7 @@ def run_round(rig, detector, output, viewer, record):
             rig.data.ctrl[rig.motor] = 0.0
         view.result = result['status']
         view.draw(hold_frames=2 * FPS)
-    result.update(positions=rig.results, events=rig.events,
+    result.update(positions=rig.results, events=rig.events, moves=rig.moves, cycle_time_s=float(rig.data.time),
                   final={site: rig.snapshot(station) for site, station in rig.stations.items()})
     if not view.rows:
         view.rows.append(rig.snapshot())
@@ -317,7 +320,7 @@ def run_round(rig, detector, output, viewer, record):
 
 
 def run_assembly(detector, output, fault, *, sites=SITES, fault_site='S2', seed=0, image_fault='none',
-                 image_site='S2', viewer=False, video=False):
+                 image_site='S2', motion='optimized', viewer=False, video=False):
     if detector.source != 'simulation':
         raise ValueError('装配演示需要仿真检测配置')
     start, open_report = threading.Event(), threading.Event()
@@ -329,7 +332,7 @@ def run_assembly(detector, output, fault, *, sites=SITES, fault_site='S2', seed=
             open_report.set()
 
     with ExitStack() as resources:
-        rig = Assembly(fault, sites, fault_site, seed=seed, image_fault=image_fault, image_site=image_site)
+        rig = Assembly(fault, sites, fault_site, seed=seed, image_fault=image_fault, image_site=image_site, motion=motion)
         resources.callback(rig.close)
         if not viewer:
             return run_round(rig, detector, output, None, video)

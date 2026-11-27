@@ -94,18 +94,24 @@ class Simulation:
         mujoco.mj_forward(self.model, self.data)
         self.active_pose = None
 
-    def drive(self, goal, *, speed=0.8, tolerance=3e-4):
-        start = self.data.ctrl[:6].copy()
+    def motion_commands(self, start, goal, speed):
         delta = goal - start
         count = max(1, int(np.ceil(np.max(np.abs(delta)) / (speed * self.model.opt.timestep))))
         for step in range(1, count + 1):
             ratio = step / count
-            self.data.ctrl[:6] = start + (ratio**2 * (3 - 2 * ratio)) * delta
+            yield start + (ratio**2 * (3 - 2 * ratio)) * delta
+
+    def drive(self, goal, *, speed=0.8, tolerance=3e-4):
+        began = self.data.time
+        start = self.data.ctrl[:6].copy()
+        for command in self.motion_commands(start, goal, speed):
+            self.data.ctrl[:6] = command
             self.step()
+        trajectory_end = self.data.time
         for _ in range(round(4 / self.model.opt.timestep)):
             if (np.max(np.abs(self.data.qpos[:6] - goal)) < tolerance
                     and np.max(np.abs(self.data.qvel[:6])) < 0.002):
-                return
+                return float(trajectory_end - began), float(self.data.time - trajectory_end)
             self.step()
         raise RuntimeError(f'MuJoCo 关节未在时限内稳定，偏差 {np.max(np.abs(self.data.qpos[:6] - goal)):.4f} rad')
 

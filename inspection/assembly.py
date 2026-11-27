@@ -11,6 +11,7 @@ from .simulation import FAULTS, MODELS, Simulation, compile_model
 
 
 ASSEMBLY_FAULTS = ('none', 'misaligned', 'blocked', 'empty_feeder')
+MOTION_PROFILES = ('optimized', 'baseline')
 DEPTH_M = 0.006
 PITCH_MM = 2.0
 ENGAGE_XY_M = 0.00065
@@ -19,6 +20,7 @@ ENGAGE_TILT_DEG = 1.5
 TORQUE_TARGET_NM = 0.14
 TORQUE_MAX_NM = 0.20
 BEARING_FRICTION_ARM_M = 0.0055
+MAX_REFERENCE_ACCELERATION_RAD_S2 = 5.5
 
 
 def instance(template, station):
@@ -103,7 +105,8 @@ class Station:
 
 
 class Assembly(Simulation):
-    def __init__(self, fault='none', sites=SITES, fault_site='S2', *, seed=0, image_fault='none', image_site='S2'):
+    def __init__(self, fault='none', sites=SITES, fault_site='S2', *, seed=0, image_fault='none', image_site='S2',
+                 motion='optimized'):
         if fault not in ASSEMBLY_FAULTS:
             raise ValueError(f'未知装配工况 {fault}')
         self.sites = tuple(sites)
@@ -113,12 +116,17 @@ class Assembly(Simulation):
             raise ValueError(f'故障注入位置 {fault_site} 不在装配顺序内')
         if seed < 0 or image_fault not in FAULTS or image_site not in SITES:
             raise ValueError('仿真种子或图像故障设置无效')
+        if motion not in MOTION_PROFILES:
+            raise ValueError(f'未知运动曲线 {motion}')
+        self.motion = motion
         self.seed, self.image_fault, self.image_site = seed, image_fault, image_site
         rng = np.random.default_rng(seed)
         self.conditions = {site: dict(feeder_offset_mm=rng.uniform(-0.23, 0.23, 2).tolist() if seed else [0., 0.],
                                      position_bias_mm=rng.uniform(-0.28, 0.28, 2).tolist() if seed else [0., 0.],
                                      bearing_scale=float(rng.uniform(0.87, 1.13)) if seed else 1.) for site in self.sites}
         super().__init__(assembly_model(fault, self.sites, fault_site, self.conditions))
+        # A MuJoCo general position servo produces Kp*(u-q)-Kd*qdot with the model's 1:1 gear.
+        self.velocity_feedforward = -self.model.actuator_biasprm[:6, 2] / self.model.actuator_gainprm[:6, 0]
         self.scenario = fault
         self.mechanical_fault_site = fault_site
         self.motor = self.model.actuator('spindle').id
@@ -153,6 +161,7 @@ class Assembly(Simulation):
     def reset_cycle(self):
         self.stage = 'ready'
         self.events = []
+        self.moves = []
         self.station = self.stations[self.sites[0]]
         self.results = {site: dict(status='pending', after_retract=None, torque_cutoff=None, peak_torque_nm=0.0,
                                    peak_seat_force_n=0.0) for site in self.sites}
@@ -198,11 +207,39 @@ class Assembly(Simulation):
                     obstruction_force_n=self.normal_force(station, station.block),
                     bit_contact_n=self.normal_force(station, self.bit),
                     magnet=bool(data.eq_active[station.magnet]), thread=bool(data.eq_active[station.guide]),
+                    max_arm_velocity_rad_s=float(np.max(np.abs(data.qvel[:6]))),
                     **{f'q{index}_rad': float(angle) for index, angle in enumerate(data.qpos[:6], start=1)})
 
     def event(self, name):
         mujoco.mj_forward(self.model, self.data)
         self.events.append(dict(event=name, **self.snapshot()))
+
+    def motion_commands(self, start, goal, speed):
+        if self.motion == 'baseline':
+            return super().motion_commands(start, goal, speed)
+        delta = goal - start
+        distance = float(np.max(np.abs(delta)))
+        # The quintic's peak velocity is 1.875*distance/T. Keep the cubic's 1.5*speed bound.
+        target_duration = max(0.10, 1.25 * distance / speed,
+                              math.sqrt((10 / math.sqrt(3)) * distance / MAX_REFERENCE_ACCELERATION_RAD_S2))
+        dt = self.model.opt.timestep
+        steps = math.ceil(target_duration / dt)
+        t = (np.arange(1, steps + 1, dtype=float) / steps)[:, None]
+        position = t**3 * (10 + t * (6 * t - 15))
+        velocity = 30 * t**2 * (1 - t)**2 / (steps * dt)
+        bounds = self.model.actuator_ctrlrange[:6]
+        commands = start + (position + velocity * self.velocity_feedforward) * delta
+        return np.clip(commands, bounds[:, 0], bounds[:, 1])
+
+    def drive(self, goal, *, speed=0.8, tolerance=3e-4):
+        began = float(self.data.time)
+        travel, settling = super().drive(goal, speed=speed, tolerance=tolerance)
+        site, angle = self.active_pose or (self.station.name, None)
+        self.moves.append(dict(stage=self.stage, site=site, angle=angle, began_at_s=began,
+                               travel_s=travel, settling_s=settling,
+                               settled_error_rad=float(np.max(np.abs(self.data.qpos[:6] - goal))),
+                               settled_velocity_rad_s=float(np.max(np.abs(self.data.qvel[:6])))))
+        return travel, settling
 
     def move_xyz(self, stage, xyz, speed=0.55):
         self.stage = stage
