@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+outputs/
+station/local.json
+station/local.script
+station/profile.local.json
+station/references/

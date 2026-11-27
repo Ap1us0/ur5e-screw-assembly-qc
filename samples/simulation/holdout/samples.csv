@@ -1,0 +1,15 @@
+﻿site,angle,expected,image
+S1,primary,present,S1_primary_present.png
+S1,alternate,present,S1_alternate_present.png
+S2,primary,present,S2_primary_present.png
+S2,alternate,present,S2_alternate_present.png
+S3,primary,present,S3_primary_present.png
+S3,alternate,present,S3_alternate_present.png
+S1,primary,missing,S1_primary_missing.png
+S1,alternate,missing,S1_alternate_missing.png
+S2,primary,missing,S2_primary_missing.png
+S2,alternate,missing,S2_alternate_missing.png
+S3,primary,missing,S3_primary_missing.png
+S3,alternate,missing,S3_alternate_missing.png
+S2,primary,review,S2_primary_glare.png
+S2,primary,review,S2_primary_blur.png

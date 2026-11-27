@@ -1,0 +1,72 @@
+<assembly>
+  <worldbody>
+    <geom name="feeder_base" type="cylinder" pos="-0.430 -0.236 0.047" size="0.034 0.047"
+          rgba="0.14 0.31 0.34 1"/>
+    <geom name="feeder_seat" type="cylinder" pos="-0.430 -0.236 0.0945" size="0.015 0.0005"
+          rgba="0.33 0.54 0.56 1"/>
+    <geom name="blocked_seat" type="cylinder" pos="-0.510 0 0.0795" size="0.010 0.0015"
+          rgba="0.80 0.42 0.20 1" contype="1" conaffinity="2"/>
+
+    <body name="loose_screw" pos="-0.430 -0.236 0.095">
+      <freejoint name="screw_free"/>
+      <inertial pos="0 0 -0.003" mass="0.012" diaginertia="0.00000023 0.00000023 0.00000025"/>
+      <geom name="assembled_head" class="screw" pos="0 0 0.00165" contype="2" conaffinity="5"
+            friction="0.62 0.007 0.0001" condim="4" priority="1" solref="0.004 1" solimp="0.995 0.999 0.00015"/>
+      <geom name="assembled_shank" type="cylinder" pos="0 0 -0.006" size="0.0040 0.006"
+            rgba="0.46 0.49 0.51 1" contype="0" conaffinity="0"/>
+      <geom class="slot" pos="0 0 0.00331" euler="0 0 0.5"/>
+      <geom class="slot" pos="0 0 0.00332" euler="0 0 2.0708"/>
+      <site name="screw_socket" pos="0 0 0.0033" size="0.001" rgba="0 0 0 0"/>
+      <site name="screw_axis" size="0.001" rgba="0 0 0 0"/>
+    </body>
+
+    <body name="thread_guide" pos="-0.510 0 0.084" gravcomp="1">
+      <inertial pos="0 0 0" mass="0.030" diaginertia="0.000012 0.000012 0.000012"/>
+      <joint name="thread_depth" type="slide" axis="0 0 -1" damping="8" armature="3.5"
+             range="-0.001 0.0066" solreflimit="0.004 1" solimplimit="0.995 0.999 0.0001"/>
+      <joint name="thread_angle" type="hinge" axis="0 0 -1" damping="0.0012" frictionloss="0.012"
+             armature="0.000065"/>
+      <site name="thread_entry" size="0.001" rgba="0 0 0 0"/>
+    </body>
+  </worldbody>
+
+  <wrist>
+    <geom name="driver_bracket" type="box" pos="0.044 0.116 0" size="0.039 0.012 0.020"
+          rgba="0.20 0.25 0.28 1" contype="0" conaffinity="0"/>
+    <geom name="driver_housing" type="cylinder" pos="0.073 0.150 0" size="0.018 0.045"
+          quat="0.70710678 -0.70710678 0 0" rgba="0.20 0.47 0.50 1" mass="0.24" contype="0" conaffinity="0"/>
+    <site name="driver_reference" pos="0.073 0.229 0" xyaxes="1 0 0 0 0 1" rgba="0 0 0 0"/>
+    <body name="driver_slide" pos="0.073 0.198 0" gravcomp="1">
+      <inertial mass="0.15" pos="0 0 0" diaginertia="0.000020 0.000014 0.000020"/>
+      <joint name="driver_axial" type="slide" axis="0 1 0" range="-0.012 0.013" stiffness="1500"
+             springref="0.006" damping="13" armature="0.060"/>
+      <body name="driver_spindle" gravcomp="1">
+        <inertial mass="0.035" pos="0 0.005 0" diaginertia="0.000005 0.0000012 0.000005"/>
+        <joint name="spindle_angle" axis="0 1 0" limited="false" damping="0.00025" armature="0.00014"/>
+        <geom name="spindle_chuck" type="cylinder" pos="0 0.006 0" size="0.011 0.009"
+              quat="0.70710678 -0.70710678 0 0" rgba="0.38 0.42 0.45 1" contype="0" conaffinity="0"/>
+        <geom name="spindle_marker" type="box" pos="0.0095 0.007 0" size="0.002 0.007 0.002"
+              rgba="0.95 0.75 0.27 1" contype="0" conaffinity="0"/>
+        <geom name="driver_bit" type="cylinder" pos="0 0.020 0" size="0.0038 0.005"
+              quat="0.70710678 -0.70710678 0 0" rgba="0.69 0.72 0.72 1"
+              contype="4" conaffinity="1" solref="0.006 1"/>
+        <site name="driver_tip" pos="0 0.025 0" xyaxes="1 0 0 0 0 1" size="0.001" rgba="0 0 0 0"/>
+      </body>
+    </body>
+  </wrist>
+
+  <equality>
+    <joint name="thread_pitch" joint1="thread_depth" joint2="thread_angle" polycoef="0 0.000318309886 0 0 0"
+           solref="0.001 1" solimp="0.999 0.9999 0.00005"/>
+    <joint name="keyed_drive" joint1="spindle_angle" joint2="thread_angle" active="false"
+           polycoef="0 1 0 0 0" solref="0.005 1" solimp="0.97 0.995 0.0001"/>
+    <weld name="magnetic_bit" site1="driver_tip" site2="screw_socket" active="false" torquescale="0.022"
+          solref="0.007 1" solimp="0.97 0.995 0.00025"/>
+    <weld name="thread_capture" site1="thread_entry" site2="screw_axis" active="false" torquescale="0.040"
+          solref="0.004 1" solimp="0.999 0.9999 0.0001"/>
+  </equality>
+
+  <actuator>
+    <velocity name="spindle" joint="spindle_angle" kv="0.030" ctrlrange="-18 18" forcerange="-0.20 0.20"/>
+  </actuator>
+</assembly>

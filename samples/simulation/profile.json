@@ -1,0 +1,136 @@
+{
+  "version": 1,
+  "source": "simulation",
+  "frame_size": [
+    640,
+    480
+  ],
+  "views": {
+    "S1": {
+      "primary": {
+        "roi": [
+          269,
+          189,
+          102,
+          102
+        ],
+        "shift_px": 6,
+        "min_sharpness": 45,
+        "max_glare": 0.12,
+        "max_dark": 0.18,
+        "min_score": 0.68,
+        "min_margin": 0.2,
+        "present": [
+          "references/S1_primary_present.png"
+        ],
+        "missing": [
+          "references/S1_primary_missing.png"
+        ]
+      },
+      "alternate": {
+        "roi": [
+          269,
+          189,
+          102,
+          102
+        ],
+        "shift_px": 6,
+        "min_sharpness": 45,
+        "max_glare": 0.12,
+        "max_dark": 0.18,
+        "min_score": 0.68,
+        "min_margin": 0.2,
+        "present": [
+          "references/S1_alternate_present.png"
+        ],
+        "missing": [
+          "references/S1_alternate_missing.png"
+        ]
+      }
+    },
+    "S2": {
+      "primary": {
+        "roi": [
+          269,
+          189,
+          102,
+          102
+        ],
+        "shift_px": 6,
+        "min_sharpness": 45,
+        "max_glare": 0.12,
+        "max_dark": 0.18,
+        "min_score": 0.68,
+        "min_margin": 0.2,
+        "present": [
+          "references/S2_primary_present.png"
+        ],
+        "missing": [
+          "references/S2_primary_missing.png"
+        ]
+      },
+      "alternate": {
+        "roi": [
+          269,
+          189,
+          102,
+          102
+        ],
+        "shift_px": 6,
+        "min_sharpness": 45,
+        "max_glare": 0.12,
+        "max_dark": 0.18,
+        "min_score": 0.68,
+        "min_margin": 0.2,
+        "present": [
+          "references/S2_alternate_present.png"
+        ],
+        "missing": [
+          "references/S2_alternate_missing.png"
+        ]
+      }
+    },
+    "S3": {
+      "primary": {
+        "roi": [
+          269,
+          189,
+          102,
+          102
+        ],
+        "shift_px": 6,
+        "min_sharpness": 45,
+        "max_glare": 0.12,
+        "max_dark": 0.18,
+        "min_score": 0.68,
+        "min_margin": 0.2,
+        "present": [
+          "references/S3_primary_present.png"
+        ],
+        "missing": [
+          "references/S3_primary_missing.png"
+        ]
+      },
+      "alternate": {
+        "roi": [
+          269,
+          189,
+          102,
+          102
+        ],
+        "shift_px": 6,
+        "min_sharpness": 45,
+        "max_glare": 0.12,
+        "max_dark": 0.18,
+        "min_score": 0.68,
+        "min_margin": 0.2,
+        "present": [
+          "references/S3_alternate_present.png"
+        ],
+        "missing": [
+          "references/S3_alternate_missing.png"
+        ]
+      }
+    }
+  }
+}

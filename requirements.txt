@@ -1,0 +1,5 @@
+numpy==2.2.6
+mujoco==3.16.0
+opencv-python-headless==4.11.0.86
+imageio-ffmpeg==0.6.0
+matplotlib==3.10.9

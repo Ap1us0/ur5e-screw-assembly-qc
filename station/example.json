@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "route_id": "fixture01",
+  "pc_ip": "192.0.2.10",
+  "robot_ip": "192.0.2.20",
+  "port": 51005,
+  "connect_timeout_s": 20,
+  "move_timeout_s": 45,
+  "camera": {"index": 0, "frame_size": [640, 480]},
+  "speed_rad_s": 0.2,
+  "acceleration_rad_s2": 0.3,
+  "home": [],
+  "routes": {
+    "S1": {"primary": [], "alternate": []},
+    "S2": {"primary": [], "alternate": []},
+    "S3": {"primary": [], "alternate": []}
+  }
+}
