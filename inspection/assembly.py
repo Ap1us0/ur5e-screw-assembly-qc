@@ -11,14 +11,16 @@ from .force_insertion import (CONTACT_DT_S, FORCE_ENTRY_TOLERANCE_M, INSERTION_M
                               MAX_ATTEMPTS, MAX_PROBE_FORCE_N, MAX_SEARCH_M, OBSTRUCTION_FAULTS,
                               add_chamfer, add_chamfer_meshes, correction_step)
 from .simulation import FAULTS, MODELS, Simulation, compile_model
+from .thread_contact import (FLANK_DRAG_ARM_M, MAX_ANGLED_ENTRY_DEG, REALIGN_TILT_DEG, RECOVERY_MODES, THREAD_PITCH_MM,
+                             add_thread_flanks, initial_axis, rotation_without_yaw)
 from .vision_alignment import ALIGNMENT_FAULTS, HOLE_PLANE_Z_M, FixtureShift, Pinhole, find_hole, fit_fixture, mask_observation
 
 
-ASSEMBLY_FAULTS = ('none', 'misaligned', *OBSTRUCTION_FAULTS, 'empty_feeder')
+ASSEMBLY_FAULTS = ('none', 'misaligned', *OBSTRUCTION_FAULTS, 'cross_thread', 'empty_feeder')
 MOTION_PROFILES = ('optimized', 'baseline')
 ALIGNMENT_MODES = ('fixed', 'vision')
 DEPTH_M = 0.006
-PITCH_MM = 2.0
+PITCH_MM = THREAD_PITCH_MM
 ENGAGE_XY_M = 0.00065
 REFINE_XY_M = 0.00010
 ENGAGE_TILT_DEG = 1.5
@@ -47,7 +49,7 @@ def set_position(element, x=None, y=None):
 def assembly_model(fault, stations, fault_site, conditions, fixture_shift, alignment, insertion):
     scene = ET.parse(MODELS / 'inspection.xml').getroot()
     extra = ET.parse(MODELS / 'assembly.xml').getroot()
-    title = 'UR5e force-guided assembly' if insertion == 'force' else (
+    title = 'UR5e cross-thread recovery' if fault == 'cross_thread' else 'UR5e force-guided assembly' if insertion == 'force' else (
         'UR5e vision-guided assembly' if alignment == 'vision' else 'UR5e screw assembly')
     scene.set('model', title)
     scene.find('option').set('timestep', '0.0005')
@@ -87,6 +89,9 @@ def assembly_model(fault, stations, fault_site, conditions, fixture_shift, align
                 set_position(element, feeder_x + dx / 1000, (-0.339 if empty else -0.236) + dy / 1000)
                 for i, slot in enumerate(element.findall("geom[@class='slot']")):
                     slot.set('euler', f'0 0 {0.2 + 0.3 * index + i * math.pi / 2:.6f}')
+                if fault == 'cross_thread' and station == fault_site:
+                    guide = extra.find("worldbody/body[@name='thread_guide']")
+                    add_thread_flanks(scene.find('asset'), world, element, xy, float(guide.get('pos').split()[2]))
             if name == 'blocked_seat' and fault == 'retryable_jam':
                 holder = ET.SubElement(world, 'body', name=f'jam_fixture_{station}', mocap='true')
                 holder.append(element)
@@ -134,12 +139,15 @@ class Station:
     screw_nominal: np.ndarray
     entry_nominal: np.ndarray
     entry_actual: np.ndarray
+    flank_pairs: frozenset
+    thread_entry: int
 
 
 class Assembly(Simulation):
     def __init__(self, fault='none', sites=SITES, fault_site='S2', *, seed=0, image_fault='none', image_site='S2',
                  motion='optimized', alignment='fixed', fixture_shift=FixtureShift(), alignment_fault='none',
-                 alignment_fault_site='S2', insertion='fixed', entry_offset_mm=(0.0, 0.0), entry_offset_site='S2'):
+                 alignment_fault_site='S2', insertion='fixed', entry_offset_mm=(0.0, 0.0), entry_offset_site='S2',
+                 recovery='realign', entry_tilt_deg=None):
         if fault not in ASSEMBLY_FAULTS:
             raise ValueError(f'未知装配工况 {fault}')
         self.sites = tuple(sites)
@@ -159,6 +167,17 @@ class Assembly(Simulation):
             raise ValueError('定位图像故障需要视觉定位模式')
         if insertion not in INSERTION_MODES:
             raise ValueError(f'未知对孔方式 {insertion}')
+        if recovery not in RECOVERY_MODES:
+            raise ValueError(f'未知重试方式 {recovery}')
+        if fault == 'cross_thread' and insertion != 'force':
+            raise ValueError('斜咬牙试验使用相同的力反馈入孔，只改变重试控制')
+        if entry_tilt_deg is not None and fault != 'cross_thread':
+            raise ValueError('入口倾角只用于斜咬牙试验')
+        tilt = np.asarray((5.25, 0) if entry_tilt_deg is None else entry_tilt_deg, dtype=float)
+        if (tilt.shape != (2,) or not np.isfinite(tilt).all() or np.linalg.norm(tilt) > MAX_ANGLED_ENTRY_DEG):
+            raise ValueError('入口倾角的 XY 合计幅值不得超过 6°')
+        self.recovery = recovery
+        self.entry_tilt_deg = tilt.tolist() if fault == 'cross_thread' else None
         offset = np.asarray(entry_offset_mm, dtype=float)
         if (offset.shape != (2,) or not np.isfinite(offset).all() or np.linalg.norm(offset) > 5
                 or (np.any(offset) and entry_offset_site not in self.sites)):
@@ -193,6 +212,10 @@ class Assembly(Simulation):
         self.bit = self.model.geom('driver_bit').id
         self.stations = {}
         self.allowed_pairs = set()
+        male = [g for g in range(self.model.ngeom) if self.model.geom(g).name.startswith('male_flank_')]
+        self.female_flanks = [g for g in range(self.model.ngeom) if self.model.geom(g).name.startswith('female_flank_')]
+        flank_pairs = frozenset(frozenset((a, b)) for a in male for b in self.female_flanks)
+        self.allowed_pairs.update(flank_pairs)
         for site in self.sites:
             model = self.model
             turn = model.joint(f'thread_angle_{site}').id
@@ -207,7 +230,8 @@ class Assembly(Simulation):
                               model.geom(f'assembled_head_{site}').id, block,
                               model.equality(f'magnetic_bit_{site}').id, model.equality(f'thread_capture_{site}').id,
                               model.equality(f'keyed_drive_{site}').id, turn, dof, float(model.dof_damping[dof]),
-                              nominal, taught, actual)
+                              nominal, taught, actual, flank_pairs if site == fault_site else frozenset(),
+                              model.site(f'thread_entry_{site}').id)
             self.stations[site] = station
             self.allowed_pairs.update(frozenset((station.head, geom)) for geom in (
                 self.bit, self.plate, block, model.geom(f'feeder_seat_{site}').id, model.geom(f'feeder_base_{site}').id,
@@ -234,6 +258,7 @@ class Assembly(Simulation):
         for station in self.stations.values():
             self.model.dof_damping[station.turn_dof] = station.free_damping
             self.model.eq_data[station.key, 0] = 0
+            self.model.site_quat[station.thread_entry] = (1, 0, 0, 0)
         self.reset(self.sites, self.image_fault, self.image_site, self.seed)
         if self.jam_mocap is not None:
             self.data.mocap_pos[self.jam_mocap, 2] = -0.040
@@ -241,11 +266,17 @@ class Assembly(Simulation):
 
     def check_contacts(self):
         for contact in self.data.contact:
-            if frozenset((contact.geom1, contact.geom2)) not in self.allowed_pairs:
+            pair = frozenset((contact.geom1, contact.geom2))
+            if pair not in self.allowed_pairs:
                 self.reject_contact(contact)
 
     def normal_force(self, station, *surfaces):
         pairs = {frozenset((station.head, geom)) for geom in surfaces}
+        return self.contact_load(pairs)
+
+    def contact_load(self, pairs):
+        if not pairs:
+            return 0.0
         total = 0.0
         force = np.zeros(6)
         for i, contact in enumerate(self.data.contact):
@@ -270,10 +301,13 @@ class Assembly(Simulation):
         depth = station.entry_actual[2] - position[2]
         force = self.tool_force()
         moment = self.load_vector(self.torque_sensor)
+        tool_axis = data.site_xmat[self.reference].reshape(3, 3)[:, 2]
         return dict(sim_time_s=float(data.time), stage=self.stage, site=station.name,
                     attempt=self.attempt, tool_fx_n=float(force[0]), tool_fy_n=float(force[1]),
                     tool_fz_n=float(force[2]), tool_lateral_n=float(np.linalg.norm(force[:2])),
                     tool_mx_nm=float(moment[0]), tool_my_nm=float(moment[1]), tool_mz_nm=float(moment[2]),
+                    tool_tilt_deg=math.degrees(math.atan2(np.linalg.norm(tool_axis[:2]), tool_axis[2])),
+                    flank_force_n=self.contact_load(station.flank_pairs),
                     screw_x_m=float(position[0]), screw_y_m=float(position[1]), screw_z_m=float(position[2]),
                     tip_x_m=float(tip[0]), tip_y_m=float(tip[1]), tip_z_m=float(tip[2]),
                     radial_error_mm=float(1000 * np.linalg.norm(position[:2] - station.entry_actual[:2])),
@@ -322,9 +356,9 @@ class Assembly(Simulation):
                                settled_velocity_rad_s=float(np.max(np.abs(self.data.qvel[:6])))))
         return travel, settling
 
-    def move_xyz(self, stage, xyz, speed=0.55):
+    def move_xyz(self, stage, xyz, speed=0.55, rotation=None):
         self.stage = stage
-        goal = self.solve_pose(self.reference, xyz, np.eye(3), self.data.qpos[:6])
+        goal = self.solve_pose(self.reference, xyz, np.eye(3) if rotation is None else rotation, self.data.qpos[:6])
         self.drive(goal, speed=speed, tolerance=0.0018)
         mujoco.mj_forward(self.model, self.data)
 
@@ -510,6 +544,7 @@ class Assembly(Simulation):
 
     def insert_and_tighten(self, station, goal):
         approach = goal
+        rotation = initial_axis(self.entry_tilt_deg) if station.flank_pairs else np.eye(3)
         attempts = self.results[station.name]['attempts']
         for self.attempt in range(1, MAX_ATTEMPTS + 1):
             attempt = dict(number=self.attempt, status='probing')
@@ -517,6 +552,10 @@ class Assembly(Simulation):
             self.event('insertion_attempt')
             try:
                 approach = self.force_entry(approach, goal[:2])
+                if not np.allclose(rotation, np.eye(3)):
+                    self.move_xyz('angled_entry', approach + (0, 0, 0.0001), speed=0.16, rotation=rotation)
+                    self.step_for(0.12)
+                    self.event('angled_entry')
                 self.engage_thread(station)
             except AssemblyStopped as exc:
                 attempt.update(status='rejected', reason=str(exc))
@@ -531,20 +570,34 @@ class Assembly(Simulation):
                 self.tighten(station)
             except InsertionJammed as exc:
                 attempt.update(status='jammed', reason=str(exc))
-                self.recover_thread(station, approach)
+                if self.recovery == 'stop':
+                    raise
+                self.recover_thread(station, approach, rotation)
                 if self.attempt == MAX_ATTEMPTS:
                     raise AssemblyStopped('两次旋入均卡滞，已停转退回，等待复检', 'jam_retry_limit') from exc
-                self.clear_simulated_chip(station)
+                if self.recovery == 'realign':
+                    rotation = self.realign_after_jam(approach, rotation)
+                if self.jam_mocap is not None:
+                    self.clear_simulated_chip(station)
             else:
                 attempt['status'] = 'seated'
                 return approach
 
     def engage_thread(self, station):
         at_entry = self.snapshot()
-        tolerance = FORCE_ENTRY_TOLERANCE_M if self.insertion == 'force' else ENGAGE_XY_M
+        tilted_bite = bool(station.flank_pairs) and at_entry['tilt_deg'] > ENGAGE_TILT_DEG
+        tolerance = ENGAGE_XY_M if tilted_bite or self.insertion == 'fixed' else FORCE_ENTRY_TOLERANCE_M
+        tilt_limit = MAX_ANGLED_ENTRY_DEG if tilted_bite else ENGAGE_TILT_DEG
         if (abs(at_entry['insertion_depth_mm']) > 0.85 or at_entry['radial_error_mm'] > 1000 * tolerance
-                or at_entry['tilt_deg'] > ENGAGE_TILT_DEG):
+                or at_entry['tilt_deg'] > tilt_limit):
             raise AssemblyStopped('螺丝没有对准螺纹入口', 'thread_entry')
+        if tilted_bite:
+            axis = self.data.site_xmat[station.screw].reshape(3, 3)[:, 2]
+            wrist_tilt = rotation_without_yaw(axis)
+            # The reduced thread joint retains the incoming bite angle until reverse clears it.
+            mujoco.mju_mat2Quat(self.model.site_quat[station.thread_entry], wrist_tilt.ravel())
+        else:
+            self.model.site_quat[station.thread_entry] = (1, 0, 0, 0)
         self.model.eq_data[station.key, 0] = (self.data.joint(self.spindle_joint).qpos[0]
                                               - self.data.joint(station.turn_joint).qpos[0])
         self.data.eq_active[station.guide] = True
@@ -554,7 +607,7 @@ class Assembly(Simulation):
             self.data.mocap_pos[self.jam_mocap, 2] = 0.0
             self.event('fault_fixture_extended')
 
-    def recover_thread(self, station, approach):
+    def recover_thread(self, station, approach, rotation):
         self.stage = 'jam_brake'
         self.brake_spindle()
         self.event('jam_spindle_stopped')
@@ -565,6 +618,7 @@ class Assembly(Simulation):
         entry_angle = float(self.model.eq_data[station.key, 0])
         encoder = self.data.joint(self.spindle_joint).qpos
         self.event('unwind_started')
+        reverse_measured = False
         try:
             for _ in range(round(4 / self.model.opt.timestep)):
                 angle = float(encoder[0]) - entry_angle
@@ -572,6 +626,9 @@ class Assembly(Simulation):
                     break
                 self.data.ctrl[self.motor] = -np.sign(angle) * min(5.5, 1.2 + 1.6 * abs(angle))
                 self.step()
+                if not reverse_measured and self.data.joint(self.spindle_joint).qvel[0] < -0.12:
+                    self.event('unwind_reverse_measured')
+                    reverse_measured = True
             else:
                 raise AssemblyStopped('退牙编码器未在时限内回到入口', 'unwind_timeout')
         finally:
@@ -582,12 +639,27 @@ class Assembly(Simulation):
         self.event('unwind_complete')
         self.data.eq_active[station.key] = False
         self.data.eq_active[station.guide] = False
-        self.move_xyz('retry_retract', approach + (0, 0, 0.016), speed=0.24)
+        self.move_xyz('retry_retract', approach + (0, 0, 0.016), speed=0.24, rotation=rotation)
         tip_gap = np.linalg.norm(self.data.site_xpos[self.tip] - self.data.site_xpos[station.socket])
         lift = self.data.site_xpos[station.screw, 2] - station.entry_actual[2]
         if not self.data.eq_active[station.magnet] or tip_gap > 0.0014 or lift < 0.012:
             raise AssemblyStopped('退回时未保持螺丝', 'retry_retention')
         self.event('retry_retracted')
+
+    def realign_after_jam(self, approach, rotation):
+        axis = self.data.site_xmat[self.reference].reshape(3, 3)[:, 2]
+        tilt = math.degrees(math.atan2(np.linalg.norm(axis[:2]), axis[2]))
+        if tilt <= REALIGN_TILT_DEG:
+            return rotation
+        self.event('retry_axis_measured', measured_axis=axis.tolist())
+        # The fixed work plane provides the target normal. Remove the measured pitch/roll
+        # in free space, then let the existing force probe reacquire the hole.
+        correction = rotation_without_yaw(axis).T
+        corrected = correction @ rotation
+        self.move_xyz('retry_realign', approach + (0, 0, 0.016), speed=0.18, rotation=corrected)
+        self.step_for(0.12)
+        self.event('retry_axis_corrected')
+        return corrected if np.linalg.norm(corrected[:2, 2]) > math.sin(math.radians(REALIGN_TILT_DEG)) else np.eye(3)
 
     def clear_simulated_chip(self, station):
         # This is the removable obstruction fixture, independent of the stall detector.
@@ -636,13 +708,17 @@ class Assembly(Simulation):
             for step in range(round(8 / dt)):
                 depth = station.entry_actual[2] - self.data.site_xpos[station.screw, 2]
                 speed = 5.6 if depth >= 0.0054 else 13.0
+                if station.flank_pairs:
+                    speed = min(speed, 7.5)
                 self.data.ctrl[self.motor] = min(speed, (step + 1) * dt * 50)
                 rate = abs(self.data.qvel[station.turn_dof])
                 # Regularized under-head friction from the measured normal load. Implicit damping
                 # dissipates power even when the contact begins within a single integration step.
                 bearing_force = self.normal_force(station, self.plate, station.block)
+                drag = (bearing_arm * bearing_force
+                        + FLANK_DRAG_ARM_M * self.contact_load(station.flank_pairs))
                 self.model.dof_damping[station.turn_dof] = (station.free_damping
-                    + bearing_arm * bearing_force / max(rate, 0.30))
+                    + drag / max(rate, 0.30))
                 self.step()
                 sample = self.snapshot()
                 torque = sample['spindle_torque_nm']
@@ -653,7 +729,9 @@ class Assembly(Simulation):
                 rate = abs(float(self.data.qvel[station.turn_dof]))
                 if self.insertion == 'force':
                     tip_travel = tip_at_entry - sample['tip_z_m']
-                    early_stall = (tip_travel < DEPTH_M - 0.00075 and abs(sample['tool_fz_n']) >= 2.5
+                    loaded = (abs(sample['tool_fz_n']) >= 2.5 or sample['tool_lateral_n'] >= 1.7
+                              or math.hypot(sample['tool_mx_nm'], sample['tool_my_nm']) >= 0.012)
+                    early_stall = (tip_travel < DEPTH_M - 0.00075 and loaded
                                    and torque >= 0.155 and abs(sample['spindle_velocity_rad_s']) <= 0.8)
                     if not early_stall or abs(tip_travel - stall_begin_travel) > 0.00012:
                         stalled = 0
@@ -661,16 +739,24 @@ class Assembly(Simulation):
                     if early_stall:
                         stalled += 1
                     if stalled >= round(0.085 / dt):
-                        self.event('jam_detected', sensed_torque_nm=torque, sensed_tip_travel_mm=1000 * tip_travel)
+                        self.event('jam_detected', sensed_torque_nm=torque, sensed_tip_travel_mm=1000 * tip_travel,
+                                   jam_trigger='stall')
                         raise InsertionJammed(f'入座前扭矩升高且进给停滞，批头进给 {1000 * tip_travel:.2f} mm',
                                              'thread_jam')
+                    if (station.flank_pairs and loaded and torque >= 0.155
+                            and sample['tilt_deg'] > MAX_ANGLED_ENTRY_DEG + 0.75 and 0 < depth < 5.3):
+                        self.event('jam_detected', sensed_torque_nm=torque, sensed_tip_travel_mm=1000 * tip_travel,
+                                   jam_trigger='tilt_load')
+                        raise InsertionJammed('旋入初段扭矩升高且轴线偏差超限', 'thread_jam')
                 elif sample['obstruction_force_n'] > 3.0 and depth < DEPTH_M * 1000 - 0.7:
                     raise AssemblyStopped(f'未达到入座深度即触碰障碍，深度 {depth:.2f} mm，已停转', 'obstruction')
-                if depth > 6.65 or sample['radial_error_mm'] > 0.8 or sample['tilt_deg'] > 3.5:
+                tilt_limit = MAX_ANGLED_ENTRY_DEG + 0.75 if station.flank_pairs else 3.5
+                if depth > 6.65 or sample['radial_error_mm'] > 0.8 or sample['tilt_deg'] > tilt_limit:
                     raise AssemblyStopped('旋入超出深度或轴线容差，已停转', 'thread_limits')
                 pitch_error = abs(depth - PITCH_MM * sample['thread_turns'])
                 seated = (abs(depth - DEPTH_M * 1000) <= 0.6 and pitch_error <= 0.25 and force >= 4.0
-                          and rate <= 0.7 and TORQUE_TARGET_NM <= torque <= TORQUE_MAX_NM + 1e-6)
+                          and sample['tilt_deg'] <= ENGAGE_TILT_DEG and rate <= 0.7
+                          and TORQUE_TARGET_NM <= torque <= TORQUE_MAX_NM + 1e-6)
                 steady = steady + 1 if seated else 0
                 if steady >= round(0.10 / dt):
                     result['torque_cutoff'] = {**sample, 'thread_rate_rad_s': rate}

@@ -64,6 +64,21 @@ $inspectionPython = '.\.venv\Scripts\python.exe'
 
 本地对照共 11 组成对工况，两种入孔方式合计 22 轮，全部符合预期，零误放行。三组轻微偏孔的初始误差为 0.69–1.11 mm，力反馈将入牙前误差降到 0.14–0.22 mm，三组均完成装配和质检。三组可撤障碍均在一次重试后完成。三组永久障碍均完成两次停转退回并中止。
 
+## 斜咬牙与自主扶正重试
+
+在三颗螺丝的一键流程中，`--fault cross_thread` 给选定螺丝加入入牙倾角。螺杆和孔内以分段凸网格表示 2 mm 螺距的螺纹牙侧，倾斜时会发生实际接触，牙侧负载产生阻碍旋入的摩擦。等效螺距关节描述轴向进给，首次咬入角度来自当时的螺丝姿态。全部内牙固定在世界坐标系，整个流程没有移动测试夹具或挡块。[MuJoCo 接触与摩擦模型](https://mujoco.readthedocs.io/en/stable/computation/index.html#friction-cones)
+
+```powershell
+& $inspectionPython -m inspection assemble --fault cross_thread --fault-site S2 --seed 106 --viewer --video
+& $inspectionPython -m inspection thread-study --jobs 3
+```
+
+早段旋入监测扭矩、转速、批头进给和腕部载荷。触发后先停转，再反转退回牙口，抬起原螺丝。控制器根据抬起后的电批轴线与已知工件平面的法向偏差做姿态修正，然后用侧向力重新找孔再拧入。报告记录首次卡滞深度、牙侧力、反向转速与扶正角度，最后保留三点质检照片。`--recovery stop` 只停转，`--recovery retry` 保持原入牙姿态重试，`--recovery realign` 启用扶正后重试并作为默认模式。`--entry-tilt X Y` 可指定入牙角度。
+
+本地对照覆盖 S1、S2、S3 的四组斜咬牙和一组垂直入牙参考。三种策略共 15 轮，结果和机械证据均符合预期。四组只停转均中止，四组原姿态重试均再次卡滞，四组扶正后重试均完成装配与质检。首次卡滞发生在旋入 3.59–4.06 mm，扶正前电批倾角约 5.06–5.42°，扶正后约 0.01–0.03°。
+
+模型用于验证卡滞识别和恢复动作，螺纹材料的塑性变形与牙损仍需另行建模或实测。
+
 ## 结项复现与验收
 
 在其他 Windows 电脑可用 Python 3.12 建立项目自己的环境，启动和验收流程相同。`requirements.txt` 锁定直接依赖。

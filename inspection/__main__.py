@@ -56,7 +56,8 @@ def main():
     assembly.add_argument('--output', type=Path, default=OUTPUT / 'assembly')
     assembly.add_argument('--viewer', action='store_true', help='用 MuJoCo Viewer 启动并观看装配')
     assembly.add_argument('--video', action='store_true', help='保存运动及局部装配录像')
-    assembly.add_argument('--fault', choices=('none', 'misaligned', 'blocked', 'retryable_jam', 'empty_feeder'), default='none')
+    assembly.add_argument('--fault', choices=('none', 'misaligned', 'blocked', 'retryable_jam', 'cross_thread', 'empty_feeder'),
+                          default='none')
     assembly.add_argument('--site', choices=('all', *SITES), default='all', help='默认装配三处，也可单独验证一个位置')
     assembly.add_argument('--fault-site', choices=SITES, help='故障注入位置，三处模式默认 S2')
     assembly.add_argument('--seed', type=int, default=0, help='非零种子启用供料、对孔、摩擦和成像扰动')
@@ -72,6 +73,10 @@ def main():
     assembly.add_argument('--entry-offset', nargs=2, type=float, metavar=('X_MM', 'Y_MM'), default=(0, 0),
                           help='在装配目标中注入横向偏差，不改变孔位和相机')
     assembly.add_argument('--entry-offset-site', choices=SITES, help='偏差位置，默认与故障位置相同')
+    assembly.add_argument('--entry-tilt', nargs=2, type=float, metavar=('RX_DEG', 'RY_DEG'),
+                          help='斜咬牙工况的电批入牙倾角')
+    assembly.add_argument('--recovery', choices=('stop', 'retry', 'realign'), default='realign',
+                          help='卡滞后停转、原姿态重试或重新找正后重试')
     build = commands.add_parser('build-station', help='从真实示教点生成 PolyScope 5 脚本')
     build.add_argument('--station', type=Path, required=True)
     build.add_argument('--output', type=Path, required=True)
@@ -104,6 +109,10 @@ def main():
     force_study.add_argument('--profile', type=Path, default=SAMPLES / 'profile.json')
     force_study.add_argument('--output', type=Path, default=OUTPUT / 'force-insertion' / 'study')
     force_study.add_argument('--jobs', type=int, default=1)
+    thread_study = commands.add_parser('thread-study', help='对比斜咬牙后停转、原姿态重试和扶正重试')
+    thread_study.add_argument('--profile', type=Path, default=SAMPLES / 'profile.json')
+    thread_study.add_argument('--output', type=Path, default=OUTPUT / 'cross-thread' / 'study')
+    thread_study.add_argument('--jobs', type=int, default=1)
     accept = commands.add_parser('evaluate', help='根据独立真值记录核对 20 轮报告')
     accept.add_argument('--manifest', type=Path, required=True)
     accept.add_argument('--source', choices=('hardware', 'simulation'), default='hardware')
@@ -152,6 +161,7 @@ def main():
                                   alignment_fault=args.alignment_fault, alignment_fault_site=args.alignment_fault_site,
                                   insertion=args.insertion, entry_offset_mm=args.entry_offset,
                                   entry_offset_site=args.entry_offset_site or fault_site,
+                                  entry_tilt_deg=args.entry_tilt, recovery=args.recovery,
                                   viewer=args.viewer, video=args.video)
             if result is not None:
                 return 0 if result[1]['status'] == 'pass' else 1
@@ -205,6 +215,12 @@ def main():
 
             folder, result = run_study(args.profile.resolve(), args.output.resolve(), args.jobs)
             print(f'力反馈对比 {result["correct"]}/{result["rounds"]} · {folder / "report.html"}')
+            return 0 if result['passed'] else 1
+        elif args.action == 'thread-study':
+            from .thread_study import run_thread_study
+
+            folder, result = run_thread_study(args.profile.resolve(), args.output.resolve(), args.jobs)
+            print(f'斜咬牙恢复对比 {result["correct"]}/{result["rounds"]} · {folder / "report.html"}')
             return 0 if result['passed'] else 1
         elif args.action in ('evaluate', 'simulate-acceptance'):
             if args.action == 'evaluate':
