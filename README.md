@@ -47,6 +47,23 @@ $inspectionPython = '.\.venv\Scripts\python.exe'
 
 本地仿真结果中，固定示教在 12 轮偏移工况全部触发对孔停机，视觉定位完成 12 轮装配和质检。3 轮双视角遮挡均在取件前中止。另跑 24 轮随机偏移，全部完成装配和质检。两组视觉试验的最大孔心误差为 0.083 mm。`alignment-study` 在输出目录保存每轮报告、CSV 与 JSON。
 
+## 电批力反馈找正与卡滞重试
+
+`assemble` 默认使用 `--insertion force`。MuJoCo Viewer 按一次 Enter 即依次装配三颗并在撤刀后统一质检。启用腕部视觉时，先拍三孔估计夹具位姿，再在每个孔口执行力反馈找正。原有固定入孔流程可用 `--insertion fixed` 对照。下面的演示在 S1 注入横向偏差，在 S2 布置可撤障碍，在 S3 定位时模拟主视角反光。
+
+```powershell
+& $inspectionPython -m inspection assemble --alignment vision --fixture-shift -8 4 -4 --alignment-fault glare --alignment-fault-site S3 --entry-offset 1.1 0 --entry-offset-site S1 --fault retryable_jam --fault-site S2 --seed 106 --viewer --video
+& $inspectionPython -m inspection force-study --jobs 3
+```
+
+螺丝导入端与孔口倒角使用 MuJoCo 的实际碰撞接触。电批在主轴处装有虚拟六轴传感器。螺丝下探时批头不转，控制器每 40 ms 平均侧向载荷，并据此修正 XY 目标。单次微调上限是 0.18 mm，距原目标的微调半径上限是 1.8 mm。入牙前另有 0.35 mm 仿真对孔门限。超界或找正超时，先抬起螺丝，再结束本轮。[MuJoCo 力与力矩传感器](https://mujoco.readthedocs.io/en/stable/XMLreference.html#sensor-force)
+
+如果入座前的高扭矩、轴向受力和低转速持续存在，且这段时间内批头没有继续下进，电批停止正转。确认停稳后，电批低速反转退牙，再带同一颗螺丝抬起并重新找正。每颗只允许一次重试。持久卡滞在第二次退回后中止整轮。可撤障碍工况由仿真测试夹具在第一次退回后撤除挡块，随后验证重试流程。`--fault blocked` 用于验证不可恢复卡滞。
+
+每轮输出的 `force_trace.png` 将仿真孔心偏差、腕部载荷、带方向的电批速度和入孔深度对齐。报告保留每次找正修正、停转、反转与退回事件。控制参数和接触模型用于 MuJoCo 仿真。实机还需标定传感器零点和工具载荷，并按实际螺纹、工件公差和允许接触力重新验证。
+
+本地对照共 11 组成对工况，两种入孔方式合计 22 轮，全部符合预期，零误放行。三组轻微偏孔的初始误差为 0.69–1.11 mm，力反馈将入牙前误差降到 0.14–0.22 mm，三组均完成装配和质检。三组可撤障碍均在一次重试后完成。三组永久障碍均完成两次停转退回并中止。
+
 ## 结项复现与验收
 
 在其他 Windows 电脑可用 Python 3.12 建立项目自己的环境，启动和验收流程相同。`requirements.txt` 锁定直接依赖。

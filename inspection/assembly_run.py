@@ -12,6 +12,7 @@ import numpy as np
 from .assembly import Assembly, AssemblyStopped, ENGAGE_XY_M, PITCH_MM, TORQUE_TARGET_NM
 from .demo import FPS, VIDEO_SIZE, VIEW_SIZE, overlay_text, overview_camera
 from .detector import SITES, save_image
+from .force_insertion import FORCE_ENTRY_TOLERANCE_M
 from .samples import write_csv, write_json
 from .vision_alignment import FixtureShift, marked_photo
 from .workflow import inspect_workpiece, new_run
@@ -22,6 +23,8 @@ STAGES = {
     'ready': 'Ready', 'approach_feed': 'Approach feeder', 'index': 'Index bit', 'pick': 'Pick screw',
     'lift': 'Verify pickup', 'transfer': 'Transfer over fixture', 'align': 'Align to hole',
     'insert': 'Enter thread', 'tighten': 'Drive and torque-check',
+    'probe': 'Force-guided alignment', 'jam_brake': 'Jam: brake spindle',
+    'unwind': 'Reverse out of thread', 'retry_retract': 'Retract with screw',
     'release': 'Release bit', 'retract': 'Retract and verify', 'inspection': 'Inspect all positions',
 }
 RESULTS = {'pass': 'ASSEMBLY PASS', 'review': 'REVIEW REQUIRED', 'aborted': 'ASSEMBLY ABORTED', 'error': 'SIMULATION ERROR'}
@@ -119,12 +122,16 @@ class AssemblyView:
         if self.result:
             title = RESULTS[self.result]
         closeup, image_title = self.closeup()
-        driver_state = 'Running' if metrics['spindle_velocity_command_rad_s'] else 'Stopped'
+        speed = metrics['spindle_velocity_command_rad_s']
+        driver_state = ('Reverse' if speed < 0 else 'Forward' if speed > 0 else
+                        'Braking' if abs(metrics['spindle_velocity_rad_s']) > 0.08 else 'Stopped')
         depth = max(0.0, metrics['insertion_depth_mm'])
         progress = '  /  '.join(f'{site} {entry["status"]}' for site, entry in self.rig.results.items())
         if self.rig.stage == 'calibration':
             located = sum(record['observation'] is not None for record in self.rig.alignment_attempts)
             progress = f'Wrist camera registration   {located} / 3 holes'
+        elif active and metrics['attempt'] and self.rig.stage in ('probe', 'tighten', 'jam_brake', 'unwind', 'retry_retract'):
+            progress = f'Attempt {metrics["attempt"]}   |   {progress}'
         cutoff = self.rig.results[metrics['site']]['torque_cutoff']
         display_torque = cutoff['spindle_torque_nm'] if self.result and cutoff else metrics['spindle_torque_nm']
         if visible:
@@ -133,9 +140,10 @@ class AssemblyView:
             instructions = 'Enter: repeat  |  O: report' if self.result else 'Enter: start' if self.rig.stage == 'ready' else ''
             viewer.set_texts([
                 (None, mujoco.mjtGridPos.mjGRID_TOPLEFT,
-                 'UR5e assembly\nStatus\nDepth\nSpindle torque\nTurns\nDriver',
+                 'UR5e assembly\nStatus\nDepth\nSpindle torque\nTurns\nDriver\nWrist force XY / Z',
                  f'{title}\n{progress}\n{depth:.2f} mm\n{display_torque:.3f} Nm\n'
-                 f'{metrics["thread_turns"]:.2f}\n{driver_state}'),
+                 f'{metrics["thread_turns"]:.2f}\n{driver_state}\n'
+                 f'{metrics["tool_lateral_n"]:.2f} / {metrics["tool_fz_n"]:+.2f} N'),
                 (None, mujoco.mjtGridPos.mjGRID_BOTTOMLEFT, instructions, ''),
             ])
             viewport = viewer.viewport
@@ -171,7 +179,7 @@ class AssemblyView:
             ('Insertion depth', f'{depth:.2f} mm'),
             ('Thread turns', f'{metrics["thread_turns"]:.2f}'),
             ('Spindle torque', f'{display_torque:.3f} Nm'),
-            ('Seating force', f'{metrics["seat_force_n"]:.1f} N'),
+            ('Wrist force XY / Z', f'{metrics["tool_lateral_n"]:.2f} / {metrics["tool_fz_n"]:+.2f} N'),
             ('Driver', driver_state),
         )
         for i, (label, value) in enumerate(values):
@@ -235,6 +243,67 @@ def plot_trace(folder, rows):
     return True
 
 
+def plot_force_trace(folder, rows, events):
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    stages = ('probe', 'tighten', 'jam_brake', 'unwind', 'retry_retract')
+    sites = {site: [row for row in rows if row['site'] == site and row['stage'] in stages]
+             for site in SITES}
+    sites = {site: samples for site, samples in sites.items() if samples}
+    if not sites:
+        return False
+    colors = dict(probe='#e1eef4', tighten='#e5f2eb', jam_brake='#f8ddd6', unwind='#f9ead5', retry_retract='#e9e5f2')
+    labels = dict(probe='Probe', tighten='Drive', jam_brake='Brake', unwind='Reverse', retry_retract='Retract')
+    series = (
+        ('XY error (mm)', (('radial_error_mm', 'Screw axis', '#1b6d74'),)),
+        ('Wrist load (N)', (('tool_lateral_n', 'XY magnitude', '#1b6d74'), ('tool_fz_n', 'Signed Z', '#b05328'))),
+        ('Spindle (rad/s)', (('spindle_velocity_rad_s', 'Measured', '#1b6d74'),
+                             ('spindle_velocity_command_rad_s', 'Command', '#828aad'))),
+        ('Depth (mm)', (('insertion_depth_mm', 'Thread travel', '#1b6d74'),)),
+    )
+    fig = Figure(figsize=(max(5.8, len(sites) * 4.6), 7), layout='constrained', facecolor='#f5f8f8')
+    FigureCanvasAgg(fig)
+    grid = fig.add_gridspec(len(series), len(sites))
+    for column, (site, samples) in enumerate(sites.items()):
+        start = samples[0]['sim_time_s']
+        times = np.array([sample['sim_time_s'] - start for sample in samples])
+        cuts = [0] + [index for index in range(1, len(samples))
+                      if samples[index]['stage'] != samples[index - 1]['stage']] + [len(samples)]
+        jam_times = [e['sim_time_s'] - start for e in events if e['site'] == site and e['event'] == 'jam_detected']
+        for row, (ylabel, fields) in enumerate(series):
+            axes = fig.add_subplot(grid[row, column])
+            for begin, end in zip(cuts, cuts[1:]):
+                stage = samples[begin]['stage']
+                left, right = times[begin], times[end - 1]
+                axes.axvspan(left, right, color=colors[stage], zorder=0)
+                if row == 0 and right - left >= .25:
+                    label = labels[stage]
+                    if stage == 'probe':
+                        label += f' {samples[begin]["attempt"]}'
+                    axes.text((left + right) / 2, .94, label, fontsize=8, ha='center', va='top',
+                              transform=axes.get_xaxis_transform())
+            for key, label, color in fields:
+                axes.plot(times, [sample[key] for sample in samples], color=color, label=label, linewidth=1.1)
+            for time_at_jam in jam_times:
+                axes.axvline(time_at_jam, color='#a83026', linestyle='--', linewidth=1)
+            if row == 0:
+                axes.set_title(site, loc='left')
+                axes.axhline(1000 * FORCE_ENTRY_TOLERANCE_M, color='#a83026', linestyle=':', linewidth=1)
+            if column == 0:
+                axes.set_ylabel(ylabel)
+            if len(fields) > 1:
+                axes.legend(loc='upper right', fontsize=8)
+            if row == len(series) - 1:
+                axes.set_xlabel('Time since probe start (s)')
+            else:
+                axes.tick_params(labelbottom=False)
+            axes.set_xlim(times[0], max(times[-1], times[0] + 0.04))
+            axes.grid(alpha=.19)
+    fig.savefig(folder / 'force_trace.png', dpi=135)
+    return True
+
+
 def write_assembly_report(folder, report):
     write_json(folder / 'assembly.json', report)
     title = {'pass': '装配合格', 'review': '待复检', 'aborted': '装配中止', 'error': '仿真异常'}[report['status']]
@@ -246,18 +315,24 @@ def write_assembly_report(folder, report):
         visual += '<video controls src="assembly.mp4"></video>'
     if report['plot']:
         visual += '<img src="assembly_trace.png" alt="深度、扭矩与接触力曲线">'
+    if report['force_plot']:
+        links.append('<a href="force_trace.png">找正、停转和反转曲线</a>')
+        visual = '<img src="force_trace.png" alt="横向偏差、腕部力、批头正反转与入孔深度">' + visual
     labels = {'installed': '已装配', 'failed': '中止', 'working': '进行中', 'pending': '未装配'}
     rows = []
+    attempt_labels = {'probing': '找正', 'driving': '旋入', 'rejected': '入牙前停机', 'jammed': '卡滞', 'seated': '入座'}
     for site, entry in report['positions'].items():
         retained, cutoff = entry['after_retract'], entry['torque_cutoff']
         depth = f'{retained["insertion_depth_mm"]:.2f} mm' if retained else '—'
         turns = f'{retained["thread_turns"]:.2f}' if retained else '—'
         torque = f'{cutoff["spindle_torque_nm"]:.3f} N·m' if cutoff else '—'
-        rows.append(f'<tr><th>{site}</th><td>{labels[entry["status"]]}</td><td>{depth}</td>'
+        attempts = ' → '.join(attempt_labels[a['status']] for a in entry['attempts']) or '—'
+        rows.append(f'<tr><th>{site}</th><td>{labels[entry["status"]]}</td><td>{attempts}</td><td>{depth}</td>'
                     f'<td>{turns}</td><td>{torque}</td></tr>')
     error = f'<p>{escape(report["error"])}</p>' if report['error'] else ''
     motion_label = {'baseline': '基准运动', 'optimized': '优化运动'}[report['motion']]
-    duration = f'{motion_label} · 整轮仿真 {report["cycle_time_s"]:.2f} s'
+    insertion_label = '力反馈找正' if report['insertion'] == 'force' else '固定入孔'
+    duration = f'{motion_label} · {insertion_label} · 整轮仿真 {report["cycle_time_s"]:.2f} s'
     alignment = ''
     if report['alignment'] == 'vision':
         write_registration_report(folder, report)
@@ -272,7 +347,7 @@ def write_assembly_report(folder, report):
 main{{max-width:1080px;margin:auto;padding:28px 18px}}h1{{margin:.15em 0}}p{{margin:10px 0}}
 table{{width:100%;border-collapse:collapse;background:#fff}}th,td{{padding:7px;text-align:left;border-bottom:1px solid #d8e3e5}}
 video,img{{display:block;width:100%;border-radius:8px;margin-top:18px}}a{{color:#165669}}</style>
-<main><p>MuJoCo · UR5e</p><h1>{title}</h1><p>{duration}</p>{alignment}{error}<table><tr><th>位置</th><th>结果</th><th>撤刀后深度</th>
+<main><p>MuJoCo · UR5e</p><h1>{title}</h1><p>{duration}</p>{alignment}{error}<table><tr><th>位置</th><th>结果</th><th>装配尝试</th><th>撤刀后深度</th>
 <th>圈数</th><th>停转扭矩</th></tr>{''.join(rows)}</table><p>{' · '.join(links)}</p>{visual}</main></html>'''
     (folder / 'report.html').write_text(page, encoding='utf-8')
 
@@ -307,10 +382,11 @@ figure{{margin:0;padding:10px;background:#fff;border-radius:8px}}a{{color:#16566
 def run_round(rig, detector, output, viewer, record):
     folder = new_run(output)
     rig.reset_cycle()
-    result = dict(version=2, source='simulation', scenario=rig.scenario,
+    result = dict(version=3, source='simulation', scenario=rig.scenario,
                   fault_site=rig.mechanical_fault_site if rig.scenario != 'none' else None,
                   seed=rig.seed, image_fault=rig.image_fault, image_site=rig.image_site, conditions=rig.conditions,
                   motion=rig.motion, alignment=rig.alignment, fixture_shift_truth=asdict(rig.fixture_shift),
+                  insertion=rig.insertion, entry_offset_mm=rig.entry_offset_mm, entry_offset_site=rig.entry_offset_site,
                   alignment_fault=rig.alignment_fault, alignment_fault_site=rig.alignment_fault_site,
                   registration=None,
                   order=list(rig.sites), status='error', error=None, stop_code=None, inspection_started_at_s=None,
@@ -382,6 +458,7 @@ def run_round(rig, detector, output, viewer, record):
         view.rows.append(rig.snapshot())
     write_csv(folder / 'assembly_trace.csv', tuple(view.rows[0]), view.rows)
     result['plot'] = plot_trace(folder, view.rows)
+    result['force_plot'] = rig.insertion == 'force' and plot_force_trace(folder, view.rows, rig.events)
     result['video'] = record and (folder / 'assembly.mp4').stat().st_size > 0
     write_assembly_report(folder, result)
     print(f'{RESULTS[result["status"]]} · {folder / "report.html"}', flush=True)
@@ -392,7 +469,8 @@ def run_round(rig, detector, output, viewer, record):
 
 def run_assembly(detector, output, fault, *, sites=SITES, fault_site='S2', seed=0, image_fault='none',
                  image_site='S2', motion='optimized', alignment='fixed', fixture_shift=FixtureShift(),
-                 alignment_fault='none', alignment_fault_site='S2', viewer=False, video=False):
+                 alignment_fault='none', alignment_fault_site='S2', viewer=False, video=False,
+                 insertion='fixed', entry_offset_mm=(0.0, 0.0), entry_offset_site='S2'):
     if detector.source != 'simulation':
         raise ValueError('装配演示需要仿真检测配置')
     start, open_report = threading.Event(), threading.Event()
@@ -406,7 +484,8 @@ def run_assembly(detector, output, fault, *, sites=SITES, fault_site='S2', seed=
     with ExitStack() as resources:
         rig = Assembly(fault, sites, fault_site, seed=seed, image_fault=image_fault, image_site=image_site,
                        motion=motion, alignment=alignment, fixture_shift=fixture_shift,
-                       alignment_fault=alignment_fault, alignment_fault_site=alignment_fault_site)
+                       alignment_fault=alignment_fault, alignment_fault_site=alignment_fault_site,
+                       insertion=insertion, entry_offset_mm=entry_offset_mm, entry_offset_site=entry_offset_site)
         resources.callback(rig.close)
         if not viewer:
             return run_round(rig, detector, output, None, video)

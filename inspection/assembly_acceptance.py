@@ -44,9 +44,11 @@ LIFECYCLE = ('pickup_contact', 'screw_lifted', 'axis_alignment', 'thread_engaged
 
 def mechanical_evidence(site, result):
     events = [event for event in result['events'] if event['site'] == site]
-    sequence = tuple(event['event'] for event in events if event['event'] in LIFECYCLE)
     summary = result['positions'][site]
     cutoff, final = summary['torque_cutoff'], result['final'][site]
+    successful_attempt = cutoff.get('attempt', 0) if cutoff else 0
+    sequence = tuple(event['event'] for event in events if event['event'] in LIFECYCLE
+                     and (event['event'] != 'thread_engaged' or event.get('attempt', 0) == successful_attempt))
     return bool(sequence == LIFECYCLE and cutoff and summary['after_retract']
                 and events[0]['bit_contact_n'] >= 0.15
                 and cutoff['seat_force_n'] >= 4.0 and cutoff['thread_rate_rad_s'] <= 0.70
